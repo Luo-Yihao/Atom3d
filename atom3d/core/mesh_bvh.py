@@ -1,0 +1,740 @@
+"""
+MeshBVH: Core mesh class for Atom3D
+
+Provides BVH acceleration and all collision/query primitives.
+"""
+
+from typing import Optional, Tuple, Union
+import torch
+
+from .data_structures import (
+    AABBIntersectResult,
+    RayIntersectResult,
+    SegmentIntersectResult,
+    ClosestPointResult,
+    TriangleIntersectResult,
+)
+
+# Try to import CUDA kernels
+try:
+    from ..kernels import (
+        cuda_available, 
+        triangle_aabb_intersect, 
+        ray_mesh_intersect, 
+        point_mesh_udf,
+        sat_clip_polygon
+    )
+    HAS_CUDA = cuda_available()
+except ImportError:
+    HAS_CUDA = False
+
+# Try to import cubvh for BVH acceleration
+try:
+    import cubvh
+    HAS_CUBVH = True
+except ImportError:
+    HAS_CUBVH = False
+
+
+class MeshBVH:
+    """
+    Mesh with BVH acceleration structure.
+    
+    Provides all collision and query primitives:
+    - intersect_aabb: Triangle-AABB intersection with optional polygon clipping
+    - intersect_ray: Ray-mesh intersection
+    - intersect_segment: Segment-mesh intersection
+    - udf: Unsigned distance field query
+    - sdf: Signed distance field query (requires watertight mesh)
+    
+    Args:
+        vertices: [N, 3] float32 vertex coordinates
+        faces: [M, 3] int32 triangle face indices
+        device: Compute device ('cuda' or 'cpu')
+    """
+    
+    def __init__(
+        self,
+        vertices: torch.Tensor,
+        faces: torch.Tensor,
+        device: str = 'cuda'
+    ):
+        self.vertices = vertices.to(device).float()
+        self.faces = faces.to(device).int()
+        self.device = device
+        self.num_vertices = self.vertices.shape[0]
+        self.num_faces = self.faces.shape[0]
+        
+        # Compute mesh bounds
+        self._bounds = torch.stack([
+            self.vertices.min(dim=0)[0],
+            self.vertices.max(dim=0)[0]
+        ])
+        
+        # Precompute face vertices for SAT clip
+        self._face_verts_flat = None
+        
+        # Build BVH
+        self._build_bvh()
+    
+    def _build_bvh(self):
+        """Build BVH acceleration structure."""
+        if HAS_CUBVH and self.device == 'cuda':
+            try:
+                self._bvh = cubvh.cuBVH(self.vertices, self.faces)
+            except:
+                self._bvh = None
+        else:
+            self._bvh = None
+    
+    def _get_face_verts_flat(self) -> torch.Tensor:
+        """Get flattened triangle vertices [M, 9] for SAT clip kernel."""
+        if self._face_verts_flat is None:
+            tri_verts = self.vertices[self.faces]  # [M, 3, 3]
+            self._face_verts_flat = tri_verts.reshape(-1, 9)
+        return self._face_verts_flat
+    
+    # ==================== Properties ====================
+    
+    def get_bounds(self) -> torch.Tensor:
+        """
+        Get mesh bounding box.
+        
+        Returns:
+            bounds: [2, 3] [[min_xyz], [max_xyz]]
+        """
+        return self._bounds
+    
+    def get_face_aabb(
+        self, 
+        face_indices: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get per-triangle AABBs.
+        
+        Args:
+            face_indices: [K] face indices (None = all faces)
+        
+        Returns:
+            aabb_min: [K, 3]
+            aabb_max: [K, 3]
+        """
+        if face_indices is None:
+            faces = self.faces
+        else:
+            faces = self.faces[face_indices]
+        
+        tri_verts = self.vertices[faces]  # [K, 3, 3]
+        aabb_min = tri_verts.min(dim=1)[0]
+        aabb_max = tri_verts.max(dim=1)[0]
+        
+        return aabb_min, aabb_max
+    
+    # ==================== Triangle-AABB Intersection ====================
+    
+    def intersect_aabb(
+        self,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+        mode: int = 1
+    ) -> AABBIntersectResult:
+        """
+        Triangle-AABB batch intersection using SAT.
+        
+        Args:
+            aabb_min: [N, 3] AABB min coordinates
+            aabb_max: [N, 3] AABB max coordinates
+            mode: Output mode
+                0 = hit mask only
+                1 = hit mask + (aabb_id, face_id) pairs (default)
+                2 = hit mask + pairs + centroid + area
+                3 = hit mask + pairs + centroid + area + polygon vertices
+        
+        Returns:
+            result: AABBIntersectResult
+                - hit: [N] bool
+                - aabb_ids: [num_hits] int (if mode >= 1)
+                - face_ids: [num_hits] int (if mode >= 1)
+                - centroids: [num_hits, 3] float (if mode >= 2)
+                - areas: [num_hits] float (if mode >= 2)
+                - poly_verts: [num_hits, 8, 3] float (if mode == 3)
+                - poly_counts: [num_hits] int (if mode == 3)
+        """
+        N = aabb_min.shape[0]
+        
+        # Mode 0 or 1: Use basic SAT kernel
+        if mode <= 1:
+            return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=(mode >= 1))
+        
+        # Mode 2 or 3: Use SAT clip polygon kernel
+        return self._intersect_aabb_clip(aabb_min, aabb_max, mode)
+    
+    def _intersect_aabb_sat(
+        self,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+        return_pairs: bool
+    ) -> AABBIntersectResult:
+        """Basic SAT intersection (mode 0/1)."""
+        if HAS_CUDA and self.device == 'cuda':
+            try:
+                hit_mask, aabb_ids, face_ids = triangle_aabb_intersect(
+                    self.vertices, self.faces,
+                    aabb_min.contiguous(), aabb_max.contiguous()
+                )
+                if return_pairs:
+                    return AABBIntersectResult(hit=hit_mask, aabb_ids=aabb_ids, face_ids=face_ids)
+                else:
+                    return AABBIntersectResult(hit=hit_mask)
+            except Exception as e:
+                print(f"CUDA kernel failed: {e}")
+        
+        # Fallback: PyTorch broadphase
+        return self._intersect_aabb_pytorch(aabb_min, aabb_max, return_pairs)
+    
+    def _intersect_aabb_clip(
+        self,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+        mode: int
+    ) -> AABBIntersectResult:
+        """SAT with polygon clipping (mode 2/3)."""
+        N = aabb_min.shape[0]
+        device = aabb_min.device
+        
+        # First get all candidate pairs using broadphase
+        face_aabb_min, face_aabb_max = self.get_face_aabb()
+        M = self.num_faces
+        
+        # Broadphase: AABB-AABB overlap
+        aabb_min_exp = aabb_min.unsqueeze(1)  # [N, 1, 3]
+        aabb_max_exp = aabb_max.unsqueeze(1)
+        face_min_exp = face_aabb_min.unsqueeze(0)  # [1, M, 3]
+        face_max_exp = face_aabb_max.unsqueeze(0)
+        
+        overlap = (aabb_min_exp <= face_max_exp) & (aabb_max_exp >= face_min_exp)
+        overlap_all = overlap.all(dim=2)  # [N, M]
+        
+        cand_a, cand_t = torch.where(overlap_all)
+        
+        if len(cand_a) == 0:
+            # No candidates
+            return AABBIntersectResult(
+                hit=torch.zeros(N, dtype=torch.bool, device=device)
+            )
+        
+        # Use sat_clip_polygon kernel
+        if HAS_CUDA and self.device == 'cuda':
+            try:
+                tris_verts = self._get_face_verts_flat()
+                clip_mode = 1 if mode == 2 else 2  # kernel mode: 1=centroid, 2=full polygon
+                
+                hit_mask, poly_counts, poly_verts, centroids, areas, out_a, out_t = sat_clip_polygon(
+                    aabb_min, aabb_max, tris_verts,
+                    cand_a.long(), cand_t.long(),
+                    mode=clip_mode
+                )
+                
+                # Filter to actual hits
+                valid = hit_mask
+                
+                # Build per-aabb hit mask
+                aabb_hit = torch.zeros(N, dtype=torch.bool, device=device)
+                aabb_hit[out_a[valid]] = True
+                
+                result = AABBIntersectResult(
+                    hit=aabb_hit,
+                    aabb_ids=out_a[valid],
+                    face_ids=out_t[valid]
+                )
+                
+                # Add clip data as extra attributes
+                result.centroids = centroids[valid]
+                result.areas = areas[valid]
+                result.poly_counts = poly_counts[valid]
+                
+                if mode == 3:
+                    result.poly_verts = poly_verts[valid]
+                
+                return result
+                
+            except Exception as e:
+                print(f"SAT clip kernel failed: {e}")
+        
+        # Fallback: just return SAT result without clip data
+        return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=True)
+    
+    def _intersect_aabb_pytorch(
+        self,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor,
+        return_pairs: bool
+    ) -> AABBIntersectResult:
+        """PyTorch AABB-AABB overlap (broadphase only)."""
+        N = aabb_min.shape[0]
+        device = aabb_min.device
+        
+        face_aabb_min, face_aabb_max = self.get_face_aabb()
+        
+        aabb_min_exp = aabb_min.unsqueeze(1)
+        aabb_max_exp = aabb_max.unsqueeze(1)
+        face_min_exp = face_aabb_min.unsqueeze(0)
+        face_max_exp = face_aabb_max.unsqueeze(0)
+        
+        overlap = (aabb_min_exp <= face_max_exp) & (aabb_max_exp >= face_min_exp)
+        overlap_all = overlap.all(dim=2)
+        
+        hit = overlap_all.any(dim=1)
+        
+        if return_pairs:
+            aabb_ids, face_ids = torch.where(overlap_all)
+            return AABBIntersectResult(hit=hit, aabb_ids=aabb_ids, face_ids=face_ids)
+        else:
+            return AABBIntersectResult(hit=hit)
+    
+    # ==================== UDF/SDF ====================
+    
+    def udf(
+        self,
+        points: torch.Tensor,
+        return_grad: bool = False
+    ) -> ClosestPointResult:
+        """
+        Unsigned Distance Field query.
+        
+        Args:
+            points: [N, 3] query points
+            return_grad: If True, distances will have grad_fn (requires points.requires_grad=True)
+        
+        Returns:
+            result: ClosestPointResult
+                - distances: [N] unsigned distance
+                - face_ids: [N] closest face
+                - closest_points: [N, 3]
+                - uvw: [N, 3] barycentric coordinates
+        """
+        if return_grad:
+            return self._udf_with_grad(points)
+        else:
+            return self._udf_query(points)
+    
+    def _udf_query(self, points: torch.Tensor) -> ClosestPointResult:
+        """UDF query without gradient."""
+        N = points.shape[0]
+        device = points.device
+        
+        if HAS_CUDA and self.device == 'cuda':
+            try:
+                distances, face_ids, closest_points, uvw = point_mesh_udf(
+                    self.vertices, self.faces, points.contiguous()
+                )
+                return ClosestPointResult(
+                    distances=distances,
+                    face_ids=face_ids,
+                    closest_points=closest_points,
+                    uvw=uvw
+                )
+            except Exception as e:
+                print(f"CUDA UDF kernel failed: {e}")
+        
+        if HAS_CUBVH and self._bvh is not None:
+            distances, face_ids, closest_points = self._bvh.unsigned_distance(
+                points, return_uvw=False
+            )
+            uvw = self._compute_barycentric(points, closest_points, face_ids)
+            return ClosestPointResult(
+                distances=distances,
+                face_ids=face_ids,
+                closest_points=closest_points,
+                uvw=uvw
+            )
+        
+        return self._udf_bruteforce(points)
+    
+    def _udf_with_grad(self, points: torch.Tensor) -> ClosestPointResult:
+        """UDF query with gradient support."""
+        with torch.no_grad():
+            result = self._udf_query(points)
+        
+        # Recompute distance with gradient
+        closest_points = result.closest_points.detach()
+        diff = points - closest_points
+        distances = diff.norm(dim=1)
+        
+        return ClosestPointResult(
+            distances=distances,
+            face_ids=result.face_ids,
+            closest_points=closest_points,
+            uvw=result.uvw
+        )
+    
+    def sdf(
+        self,
+        points: torch.Tensor,
+        return_grad: bool = False
+    ) -> ClosestPointResult:
+        """
+        Signed Distance Field query.
+        
+        Requires watertight mesh with consistent winding.
+        Sign is determined by face normal direction.
+        
+        Args:
+            points: [N, 3] query points
+            return_grad: If True, distances will have grad_fn
+        
+        Returns:
+            result: ClosestPointResult with signed distances
+        """
+        result = self.udf(points, return_grad=return_grad)
+        
+        # Compute sign using closest face normal
+        signs = self._compute_sign(points, result.closest_points, result.face_ids)
+        result.distances = result.distances * signs
+        
+        return result
+    
+    def _compute_sign(
+        self,
+        points: torch.Tensor,
+        closest_points: torch.Tensor,
+        face_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute SDF sign based on face normal."""
+        device = points.device
+        N = points.shape[0]
+        
+        # Get face normals
+        valid = face_ids >= 0
+        signs = torch.ones(N, device=device)
+        
+        if valid.any():
+            tri_verts = self.vertices[self.faces[face_ids[valid]]]
+            v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
+            normals = torch.cross(v1 - v0, v2 - v0, dim=1)
+            normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-8)
+            
+            # Sign = dot(point - closest, normal)
+            to_point = points[valid] - closest_points[valid]
+            dot = (to_point * normals).sum(dim=1)
+            signs[valid] = torch.sign(dot)
+            signs[valid][signs[valid] == 0] = 1
+        
+        return signs
+    
+    def _compute_barycentric(
+        self,
+        points: torch.Tensor,
+        closest_points: torch.Tensor,
+        face_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute barycentric coordinates."""
+        N = points.shape[0]
+        device = points.device
+        uvw = torch.zeros(N, 3, device=device)
+        
+        valid = face_ids >= 0
+        if valid.any():
+            valid_faces = face_ids[valid]
+            valid_closest = closest_points[valid]
+            
+            tri_verts = self.vertices[self.faces[valid_faces]]
+            v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
+            
+            v0v1 = v1 - v0
+            v0v2 = v2 - v0
+            v0p = valid_closest - v0
+            
+            d00 = (v0v1 * v0v1).sum(dim=1)
+            d01 = (v0v1 * v0v2).sum(dim=1)
+            d11 = (v0v2 * v0v2).sum(dim=1)
+            d20 = (v0p * v0v1).sum(dim=1)
+            d21 = (v0p * v0v2).sum(dim=1)
+            
+            denom = d00 * d11 - d01 * d01
+            v = (d11 * d20 - d01 * d21) / (denom + 1e-8)
+            w = (d00 * d21 - d01 * d20) / (denom + 1e-8)
+            u = 1.0 - v - w
+            
+            uvw[valid, 0] = u
+            uvw[valid, 1] = v
+            uvw[valid, 2] = w
+        
+        return uvw
+    
+    def _udf_bruteforce(self, points: torch.Tensor) -> ClosestPointResult:
+        """Brute force UDF (fallback)."""
+        N = points.shape[0]
+        device = points.device
+        
+        distances = torch.full((N,), float('inf'), device=device)
+        face_ids = torch.full((N,), -1, dtype=torch.int32, device=device)
+        closest_points = torch.zeros(N, 3, device=device)
+        
+        tri_verts = self.vertices[self.faces]
+        
+        for i in range(N):
+            dists, closest = self._point_to_triangles(points[i], tri_verts)
+            best_idx = dists.argmin()
+            distances[i] = dists[best_idx]
+            face_ids[i] = best_idx
+            closest_points[i] = closest[best_idx]
+        
+        uvw = self._compute_barycentric(points, closest_points, face_ids)
+        
+        return ClosestPointResult(
+            distances=distances,
+            face_ids=face_ids,
+            closest_points=closest_points,
+            uvw=uvw
+        )
+    
+    def _point_to_triangles(
+        self,
+        point: torch.Tensor,
+        tri_verts: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute distance from point to all triangles."""
+        v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
+        
+        edge0 = v1 - v0
+        edge1 = v2 - v0
+        v0_to_p = point - v0
+        
+        a = (edge0 * edge0).sum(dim=1)
+        b = (edge0 * edge1).sum(dim=1)
+        c = (edge1 * edge1).sum(dim=1)
+        d = (edge0 * v0_to_p).sum(dim=1)
+        e = (edge1 * v0_to_p).sum(dim=1)
+        
+        det = a * c - b * b
+        s = b * e - c * d
+        t = b * d - a * e
+        
+        s = torch.clamp(s / (det + 1e-8), 0, 1)
+        t = torch.clamp(t / (det + 1e-8), 0, 1)
+        
+        sum_st = s + t
+        mask = sum_st > 1
+        s[mask] = s[mask] / sum_st[mask]
+        t[mask] = t[mask] / sum_st[mask]
+        
+        closest = v0 + s.unsqueeze(1) * edge0 + t.unsqueeze(1) * edge1
+        distances = (point - closest).norm(dim=1)
+        
+        return distances, closest
+    
+    # ==================== Ray Intersection ====================
+    
+    def intersect_ray(
+        self,
+        rays_o: torch.Tensor,
+        rays_d: torch.Tensor,
+        max_t: float = 1e10
+    ) -> RayIntersectResult:
+        """
+        Ray-mesh intersection.
+        
+        Args:
+            rays_o: [N, 3] ray origins
+            rays_d: [N, 3] ray directions (normalized)
+            max_t: Maximum distance
+        
+        Returns:
+            result: RayIntersectResult
+        """
+        N = rays_o.shape[0]
+        device = rays_o.device
+        
+        if HAS_CUDA and self.device == 'cuda':
+            try:
+                from ..kernels import ray_mesh_intersect
+                hit_mask, hit_t, hit_face_ids, hit_points, hit_uvs = ray_mesh_intersect(
+                    self.vertices, self.faces,
+                    rays_o.contiguous(), rays_d.contiguous(), max_t
+                )
+                
+                normals = self._compute_normals_from_faces(hit_face_ids, hit_mask)
+                bary_coords = torch.zeros(N, 3, device=device)
+                bary_coords[:, 1] = hit_uvs[:, 0]
+                bary_coords[:, 2] = hit_uvs[:, 1]
+                bary_coords[:, 0] = 1.0 - hit_uvs[:, 0] - hit_uvs[:, 1]
+                
+                return RayIntersectResult(
+                    hit=hit_mask,
+                    t=hit_t,
+                    face_ids=hit_face_ids,
+                    hit_points=hit_points,
+                    normals=normals,
+                    bary_coords=bary_coords
+                )
+            except Exception as e:
+                print(f"CUDA ray kernel failed: {e}")
+        
+        if HAS_CUBVH and self._bvh is not None:
+            positions, face_ids, depth = self._bvh.ray_trace(rays_o, rays_d)
+            hit = face_ids >= 0
+            t = depth.clone()
+            t[~hit] = float('inf')
+            normals = self._compute_normals_from_faces(face_ids, hit)
+            bary_coords = torch.zeros(N, 3, device=device)
+            
+            return RayIntersectResult(
+                hit=hit, t=t, face_ids=face_ids,
+                hit_points=positions, normals=normals, bary_coords=bary_coords
+            )
+        
+        # Fallback
+        return self._intersect_ray_bruteforce(rays_o, rays_d, max_t)
+    
+    def _compute_normals_from_faces(
+        self, 
+        face_ids: torch.Tensor, 
+        valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute normals from face indices."""
+        N = face_ids.shape[0]
+        device = face_ids.device
+        normals = torch.zeros(N, 3, device=device)
+        
+        if valid_mask.any():
+            valid_faces = face_ids[valid_mask]
+            tri_verts = self.vertices[self.faces[valid_faces]]
+            v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
+            face_normals = torch.cross(v1 - v0, v2 - v0, dim=1)
+            face_normals = face_normals / (face_normals.norm(dim=1, keepdim=True) + 1e-8)
+            normals[valid_mask] = face_normals
+        
+        return normals
+    
+    def _intersect_ray_bruteforce(
+        self,
+        rays_o: torch.Tensor,
+        rays_d: torch.Tensor,
+        max_t: float
+    ) -> RayIntersectResult:
+        """Brute force ray intersection (fallback)."""
+        N = rays_o.shape[0]
+        device = rays_o.device
+        
+        hit = torch.zeros(N, dtype=torch.bool, device=device)
+        t = torch.full((N,), float('inf'), device=device)
+        face_ids = torch.full((N,), -1, dtype=torch.int32, device=device)
+        hit_points = torch.zeros(N, 3, device=device)
+        normals = torch.zeros(N, 3, device=device)
+        bary_coords = torch.zeros(N, 3, device=device)
+        
+        tri_verts = self.vertices[self.faces]
+        v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
+        
+        for i in range(N):
+            ray_o = rays_o[i]
+            ray_d = rays_d[i]
+            
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            h = torch.cross(ray_d.expand_as(edge1), edge2)
+            a = (edge1 * h).sum(dim=1)
+            
+            valid = torch.abs(a) > 1e-8
+            f = torch.zeros_like(a)
+            f[valid] = 1.0 / a[valid]
+            
+            s = ray_o - v0
+            u = f * (s * h).sum(dim=1)
+            valid &= (u >= 0) & (u <= 1)
+            
+            q = torch.cross(s, edge1)
+            v = f * (ray_d.expand_as(q) * q).sum(dim=1)
+            valid &= (v >= 0) & (u + v <= 1)
+            
+            t_hit = f * (edge2 * q).sum(dim=1)
+            valid &= (t_hit > 1e-6) & (t_hit < max_t)
+            
+            if valid.any():
+                t_hit[~valid] = float('inf')
+                best_idx = t_hit.argmin()
+                if t_hit[best_idx] < t[i]:
+                    t[i] = t_hit[best_idx]
+                    face_ids[i] = best_idx
+                    hit[i] = True
+                    hit_points[i] = ray_o + t[i] * ray_d
+                    face_normal = torch.cross(edge1[best_idx], edge2[best_idx])
+                    normals[i] = face_normal / (face_normal.norm() + 1e-8)
+        
+        return RayIntersectResult(
+            hit=hit, t=t, face_ids=face_ids,
+            hit_points=hit_points, normals=normals, bary_coords=bary_coords
+        )
+    
+    # ==================== Segment Intersection ====================
+    
+    def intersect_segment(
+        self,
+        seg_start: torch.Tensor,
+        seg_end: torch.Tensor
+    ) -> SegmentIntersectResult:
+        """
+        Segment-mesh intersection.
+        
+        Args:
+            seg_start: [N, 3]
+            seg_end: [N, 3]
+        
+        Returns:
+            result: SegmentIntersectResult
+        """
+        rays_o = seg_start
+        rays_d = seg_end - seg_start
+        seg_lengths = rays_d.norm(dim=1, keepdim=True)
+        rays_d = rays_d / (seg_lengths + 1e-8)
+        
+        ray_result = self.intersect_ray(rays_o, rays_d, max_t=seg_lengths.squeeze().max().item())
+        hit = ray_result.hit & (ray_result.t <= seg_lengths.squeeze())
+        
+        return SegmentIntersectResult(
+            hit=hit,
+            hit_points=ray_result.hit_points,
+            face_ids=ray_result.face_ids,
+            bary_coords=ray_result.bary_coords
+        )
+    
+    # ==================== Triangle-Triangle Intersection ====================
+    
+    def intersect_triangles(
+        self,
+        other_vertices: torch.Tensor,
+        other_faces: torch.Tensor
+    ) -> TriangleIntersectResult:
+        """
+        Mesh-mesh collision detection.
+        
+        Args:
+            other_vertices: [M, 3]
+            other_faces: [K, 3]
+        
+        Returns:
+            result: TriangleIntersectResult
+        """
+        device = other_vertices.device
+        other_vertices = other_vertices.to(self.device)
+        other_faces = other_faces.to(self.device)
+        
+        K = other_faces.shape[0]
+        edge_v0_idx = other_faces[:, [0, 1, 2]].reshape(-1)
+        edge_v1_idx = other_faces[:, [1, 2, 0]].reshape(-1)
+        
+        edge_starts = other_vertices[edge_v0_idx]
+        edge_ends = other_vertices[edge_v1_idx]
+        
+        seg_result = self.intersect_segment(edge_starts, edge_ends)
+        
+        edge_hit = seg_result.hit
+        hit_indices = torch.where(edge_hit)[0]
+        
+        return TriangleIntersectResult(
+            edge_hit=edge_hit,
+            hit_points=seg_result.hit_points[hit_indices],
+            hit_face_ids=seg_result.face_ids[hit_indices],
+            hit_edge_ids=hit_indices
+        )
