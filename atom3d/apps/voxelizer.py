@@ -1,5 +1,7 @@
 """
-Voxelizer: Voxelization application
+Voxelizer: Mesh voxelization application
+
+Combines CubeGrid for spatial indexing with MeshBVH for collision detection.
 """
 
 import torch
@@ -7,28 +9,26 @@ from typing import Union
 
 from ..core.mesh_bvh import MeshBVH
 from ..core.data_structures import VoxelFaceMapping, VoxelPolygonMapping
-from ..grid.grid_indexer import GridIndexer
+from ..grid.cube_grid import CubeGrid
 
 
 class Voxelizer:
     """
-    体素化应用
+    Mesh voxelization application.
     
-    = GridIndexer生成的AABB + MeshBVH.intersect_aabb
-    
-    这是一个特化实例，组合了：
-    - GridIndexer: 生成grid cell AABBs
-    - MeshBVH: 检测AABB-mesh碰撞
+    Combines:
+        - CubeGrid: Generate grid cell AABBs
+        - MeshBVH: Detect AABB-mesh collisions
     
     Args:
-        bvh: MeshBVH实例
-        grid: GridIndexer实例
+        bvh: MeshBVH instance
+        grid: CubeGrid instance
     """
     
     def __init__(
         self,
         bvh: MeshBVH,
-        grid: GridIndexer
+        grid: CubeGrid
     ):
         self.bvh = bvh
         self.grid = grid
@@ -38,53 +38,55 @@ class Voxelizer:
         strategy: str = 'candidate'
     ) -> torch.Tensor:
         """
-        表面体素化（Level 1）
+        Surface voxelization.
         
-        流程:
-            1. GridIndexer生成候选cells（或所有cells）
-            2. GridIndexer.get_cell_aabb() 获取AABB
-            3. MeshBVH.intersect_aabb() 检测碰撞
+        Workflow:
+            1. Generate candidate cells (or all cells)
+            2. Get cell AABBs via CubeGrid.cube_aabb()
+            3. Detect collisions via MeshBVH.intersect_aabb()
         
         Args:
-            strategy: 'all' 测试所有cells，'candidate' 仅测试候选cells
+            strategy: 'all' test all cells, 'candidate' only test candidate cells
         
         Returns:
-            voxel_coords: [K, 3] int32 相交的体素坐标
+            voxel_coords: [K, 3] int32 intersecting voxel coordinates
         """
         if strategy == 'all':
-            # 测试所有cells（慢但完整）
+            # Test all cells (slow but complete)
             all_coords = self.grid.generate_all_cells()
-            aabb_min, aabb_max = self.grid.get_cell_aabb(all_coords)
+            cube_indices = self.grid.ijk_to_cube(all_coords)
+            aabb_min, aabb_max = self.grid.cube_aabb(cube_indices)
             result = self.bvh.intersect_aabb(aabb_min, aabb_max, return_pairs=False)
             return all_coords[result.hit]
         
         else:  # 'candidate'
-            # 使用候选cells（快速）
+            # Use candidate cells (fast)
             face_aabb_min, face_aabb_max = self.bvh.get_face_aabb()
-            candidates = self.grid.generate_candidate_cells_fast(face_aabb_min, face_aabb_max)
+            candidates = self.grid.generate_candidate_cells_from_aabb(face_aabb_min, face_aabb_max)
             
             if candidates.shape[0] == 0:
                 return torch.empty(0, 3, dtype=torch.int32, device=self.bvh.device)
             
-            aabb_min, aabb_max = self.grid.get_cell_aabb(candidates)
+            cube_indices = self.grid.ijk_to_cube(candidates)
+            aabb_min, aabb_max = self.grid.cube_aabb(cube_indices)
             result = self.bvh.intersect_aabb(aabb_min, aabb_max, return_pairs=False)
             return candidates[result.hit]
     
     def voxelize_with_faces(self) -> VoxelFaceMapping:
         """
-        体素化 + 体素-面映射（Level 2）
+        Voxelization with voxel-face mapping.
         
-        流程:
-            1. GridIndexer生成候选cells
+        Workflow:
+            1. Generate candidate cells
             2. MeshBVH.intersect_aabb(return_pairs=True)
-            3. 构建CSR格式映射
+            3. Build CSR format mapping
         
         Returns:
             mapping: VoxelFaceMapping
         """
         # Get candidates
         face_aabb_min, face_aabb_max = self.bvh.get_face_aabb()
-        candidates = self.grid.generate_candidate_cells_fast(face_aabb_min, face_aabb_max)
+        candidates = self.grid.generate_candidate_cells_from_aabb(face_aabb_min, face_aabb_max)
         
         if candidates.shape[0] == 0:
             device = self.bvh.device
@@ -96,7 +98,8 @@ class Voxelizer:
             )
         
         # Get AABB
-        aabb_min, aabb_max = self.grid.get_cell_aabb(candidates)
+        cube_indices = self.grid.ijk_to_cube(candidates)
+        aabb_min, aabb_max = self.grid.cube_aabb(cube_indices)
         
         # Intersect with pairs
         result = self.bvh.intersect_aabb(aabb_min, aabb_max, return_pairs=True)
@@ -132,20 +135,21 @@ class Voxelizer:
         max_polygon_verts: int = 8
     ) -> VoxelPolygonMapping:
         """
-        体素化 + 精确相交多边形（Level 3）
+        Voxelization with exact intersection polygons.
         
-        流程:
-            1. 先执行voxelize_with_faces
-            2. 对每个体素-面对，计算裁剪多边形
+        Workflow:
+            1. Run voxelize_with_faces first
+            2. For each voxel-face pair, compute clipped polygon
         
         Args:
-            max_polygon_verts: 最大多边形顶点数
+            max_polygon_verts: Maximum polygon vertex count
         
         Returns:
             mapping: VoxelPolygonMapping
         
         Note:
-            当前使用简化实现，完整实现需要Sutherland-Hodgman算法
+            Current implementation is simplified. Full implementation
+            requires Sutherland-Hodgman clipping algorithm.
         """
         # Get voxel-face mapping first
         vf_mapping = self.voxelize_with_faces()
@@ -175,7 +179,8 @@ class Voxelizer:
             count = vf_mapping.face_count[v_idx].item()
             
             voxel_coord = vf_mapping.voxel_coords[v_idx]
-            aabb_min, aabb_max = self.grid.get_cell_aabb(voxel_coord.unsqueeze(0))
+            cube_idx = self.grid.ijk_to_cube(voxel_coord.unsqueeze(0))
+            aabb_min, aabb_max = self.grid.cube_aabb(cube_idx)
             
             for f_offset in range(count):
                 face_id = vf_mapping.face_indices[start + f_offset]

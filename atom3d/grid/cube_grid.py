@@ -279,6 +279,102 @@ class CubeGrid:
         corners_ijk = ijk[:, None, :] + self.CUBE_CORNERS[None, :, :]  # [B, 8, 3]
         return self.vertex_to_world(corners_ijk)
     
+    def vertex_ijk_from_indices(self, vertex_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Vertex linear index -> ijk coordinates.
+        
+        Args:
+            vertex_idx: [N] or any shape, vertex linear indices
+        
+        Returns:
+            ijk: [..., 3] vertex ijk coordinates
+        """
+        p = self.num_vertices_per_axis
+        return self.unravel_idx(vertex_idx.flatten(), (p, p, p)).view(*vertex_idx.shape, 3)
+    
+    def vertex_coords_from_indices(self, vertex_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Vertex linear index -> world coordinates.
+        
+        Args:
+            vertex_idx: [N] or any shape, vertex linear indices
+        
+        Returns:
+            coords: [..., 3] vertex world coordinates
+        
+        Example:
+            grid = CubeGrid(resolution=4)
+            cube_idx = torch.tensor([0, 1, 2])
+            vertex_indices = grid.cube_corner_vertex_indices(cube_idx)  # [3, 8]
+            vertex_coords = grid.vertex_coords_from_indices(vertex_indices)  # [3, 8, 3]
+        """
+        orig_shape = vertex_idx.shape
+        vertex_idx_flat = vertex_idx.flatten()
+        
+        p = self.num_vertices_per_axis
+        ijk = self.unravel_idx(vertex_idx_flat, (p, p, p))  # [N, 3]
+        coords = self.vertex_to_world(ijk)  # [N, 3]
+        
+        return coords.view(*orig_shape, 3)
+    
+    def voxel_unique_vertices(
+        self, 
+        voxels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get unique vertices for a list of voxels.
+        
+        Given a list of voxels (either ijk coordinates or linear indices), returns:
+        - All unique vertex indices
+        - Unique vertex world coordinates
+        - Mapping from (voxel, corner) to unique vertex index
+        
+        Args:
+            voxels: [N, 3] voxel ijk coordinates OR [N] linear cube indices
+        
+        Returns:
+            unique_vertex_indices: [V] unique global vertex indices
+            unique_vertex_coords: [V, 3] unique vertex world coordinates
+            voxel_to_vertex: [N, 8] mapping: voxel_to_vertex[i, j] = index into unique_vertex_indices
+        
+        Example:
+            grid = CubeGrid(resolution=4)
+            
+            # Using ijk coordinates
+            voxels_ijk = torch.tensor([[0,0,0], [1,0,0]])
+            v_idx, v_coords, mapping = grid.voxel_unique_vertices(voxels_ijk)
+            
+            # Using linear indices
+            voxels_idx = torch.tensor([0, 1, 2])
+            v_idx, v_coords, mapping = grid.voxel_unique_vertices(voxels_idx)
+        """
+        # Auto-detect format: [N, 3] = ijk, [N] = linear idx
+        if voxels.dim() == 2 and voxels.shape[1] == 3:
+            # ijk coordinates
+            cube_idx = self.ijk_to_cube(voxels)  # [N]
+        elif voxels.dim() == 1:
+            # linear indices
+            cube_idx = voxels
+        else:
+            raise ValueError(f"voxels must be [N, 3] ijk or [N] linear idx, got shape {voxels.shape}")
+        
+        N = cube_idx.shape[0]
+        
+        # Get 8 corner vertex indices for each cube
+        corner_indices = self.cube_corner_vertex_indices(cube_idx)  # [N, 8]
+        
+        # Find unique vertices
+        all_vertex_indices = corner_indices.flatten()  # [N*8]
+        unique_vertices, inverse = torch.unique(all_vertex_indices, return_inverse=True)
+        
+        # Get unique vertex coordinates
+        unique_coords = self.vertex_coords_from_indices(unique_vertices)  # [V, 3]
+        
+        # Reshape inverse to match [N, 8]
+        voxel_to_vertex = inverse.view(N, 8)
+        
+        return unique_vertices, unique_coords, voxel_to_vertex
+    
     # ============================================================
     # Cube -> Edge (12 edges)
     # ============================================================
@@ -506,6 +602,42 @@ class CubeGrid:
         x = torch.arange(self.res, device=self.device)
         xx, yy, zz = torch.meshgrid(x, x, x, indexing='ij')
         return torch.stack([xx.flatten(), yy.flatten(), zz.flatten()], dim=1).to(self.index_dtype)
+    
+    def all_vertex_indices(self) -> torch.Tensor:
+        """
+        Get all vertex linear indices.
+        
+        Returns:
+            indices: [num_vertices] linear vertex indices
+        """
+        return torch.arange(self.num_vertices, device=self.device, dtype=self.index_dtype)
+    
+    def all_vertex_ijk(self) -> torch.Tensor:
+        """
+        Get all vertex ijk coordinates.
+        
+        Returns:
+            ijk: [num_vertices, 3] vertex ijk coordinates
+        """
+        p = self.num_vertices_per_axis
+        x = torch.arange(p, device=self.device)
+        xx, yy, zz = torch.meshgrid(x, x, x, indexing='ij')
+        return torch.stack([xx.flatten(), yy.flatten(), zz.flatten()], dim=1).to(self.index_dtype)
+    
+    def all_vertex_coords(self) -> torch.Tensor:
+        """
+        Get all vertex world coordinates.
+        
+        Returns:
+            coords: [num_vertices, 3] vertex world coordinates
+                    Shape is [(res+1)^3, 3]
+        
+        Example:
+            grid = CubeGrid(resolution=4)
+            vertices = grid.all_vertex_coords()  # [125, 3] for 5x5x5 vertices
+        """
+        vertex_ijk = self.all_vertex_ijk()
+        return self.vertex_to_world(vertex_ijk)
     
     def generate_candidate_cells_from_aabb(
         self,

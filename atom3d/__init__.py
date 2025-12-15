@@ -19,7 +19,6 @@ from .core.data_structures import (
     VoxelPolygonMapping,
     VisibilityResult,
 )
-from .grid.grid_indexer import GridIndexer
 from .grid.octree_indexer import OctreeIndexer
 from .grid.cube_grid import CubeGrid
 
@@ -36,7 +35,6 @@ __all__ = [
     "VoxelPolygonMapping",
     "VisibilityResult",
     # Grid
-    "GridIndexer",
     "OctreeIndexer",
     "CubeGrid",
 ]

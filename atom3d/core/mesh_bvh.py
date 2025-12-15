@@ -202,23 +202,26 @@ class MeshBVH:
         N = aabb_min.shape[0]
         device = aabb_min.device
         
-        # First get all candidate pairs using broadphase
-        face_aabb_min, face_aabb_max = self.get_face_aabb()
-        M = self.num_faces
+        # Use CUDA SAT kernel for fast broadphase (deterministic)
+        if HAS_CUDA and self.device == 'cuda':
+            try:
+                # Get candidate pairs from SAT kernel
+                hit_mask, cand_a, cand_t = triangle_aabb_intersect(
+                    self.vertices, self.faces,
+                    aabb_min.contiguous(), aabb_max.contiguous()
+                )
+                
+                if cand_a.numel() == 0:
+                    return AABBIntersectResult(
+                        hit=torch.zeros(N, dtype=torch.bool, device=device)
+                    )
+            except Exception as e:
+                print(f"CUDA SAT kernel failed, falling back to chunked: {e}")
+                cand_a, cand_t = self._chunked_broadphase(aabb_min, aabb_max)
+        else:
+            cand_a, cand_t = self._chunked_broadphase(aabb_min, aabb_max)
         
-        # Broadphase: AABB-AABB overlap
-        aabb_min_exp = aabb_min.unsqueeze(1)  # [N, 1, 3]
-        aabb_max_exp = aabb_max.unsqueeze(1)
-        face_min_exp = face_aabb_min.unsqueeze(0)  # [1, M, 3]
-        face_max_exp = face_aabb_max.unsqueeze(0)
-        
-        overlap = (aabb_min_exp <= face_max_exp) & (aabb_max_exp >= face_min_exp)
-        overlap_all = overlap.all(dim=2)  # [N, M]
-        
-        cand_a, cand_t = torch.where(overlap_all)
-        
-        if len(cand_a) == 0:
-            # No candidates
+        if cand_a.numel() == 0:
             return AABBIntersectResult(
                 hit=torch.zeros(N, dtype=torch.bool, device=device)
             )
@@ -264,6 +267,48 @@ class MeshBVH:
         # Fallback: just return SAT result without clip data
         return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=True)
     
+    def _chunked_broadphase(
+        self,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Chunked AABB-AABB overlap for CPU fallback."""
+        N = aabb_min.shape[0]
+        face_aabb_min, face_aabb_max = self.get_face_aabb()
+        M = self.num_faces
+        
+        aabb_chunk = 50000
+        tri_chunk = 20000
+        
+        all_cand_a = []
+        all_cand_t = []
+        
+        for a0 in range(0, N, aabb_chunk):
+            a1 = min(a0 + aabb_chunk, N)
+            aabb_min_chunk = aabb_min[a0:a1]
+            aabb_max_chunk = aabb_max[a0:a1]
+            
+            for t0 in range(0, M, tri_chunk):
+                t1 = min(t0 + tri_chunk, M)
+                face_min_chunk = face_aabb_min[t0:t1]
+                face_max_chunk = face_aabb_max[t0:t1]
+                
+                overlap = (aabb_min_chunk[:, None, :] <= face_max_chunk[None, :, :]) & \
+                          (aabb_max_chunk[:, None, :] >= face_min_chunk[None, :, :])
+                overlap_all = overlap.all(dim=2)
+                
+                local_a, local_t = torch.where(overlap_all)
+                if local_a.numel() > 0:
+                    all_cand_a.append(local_a + a0)
+                    all_cand_t.append(local_t + t0)
+        
+        if len(all_cand_a) == 0:
+            device = aabb_min.device
+            return torch.empty(0, dtype=torch.long, device=device), \
+                   torch.empty(0, dtype=torch.long, device=device)
+        
+        return torch.cat(all_cand_a), torch.cat(all_cand_t)
+    
     def _intersect_aabb_pytorch(
         self,
         aabb_min: torch.Tensor,
@@ -297,26 +342,51 @@ class MeshBVH:
     def udf(
         self,
         points: torch.Tensor,
-        return_grad: bool = False
-    ) -> ClosestPointResult:
+        return_grad: bool = False,
+        return_closest: bool = False,
+        return_uvw: bool = False,
+        return_face_ids: bool = False
+    ) -> Union[torch.Tensor, ClosestPointResult]:
         """
         Unsigned Distance Field query.
         
         Args:
             points: [N, 3] query points
             return_grad: If True, distances will have grad_fn (requires points.requires_grad=True)
+            return_closest: If True, include closest_points in result
+            return_uvw: If True, include uvw barycentric coordinates in result
+            return_face_ids: If True, include face_ids in result
         
         Returns:
-            result: ClosestPointResult
-                - distances: [N] unsigned distance
-                - face_ids: [N] closest face
-                - closest_points: [N, 3]
-                - uvw: [N, 3] barycentric coordinates
+            If all return_* are False: distances [N] tensor
+            Otherwise: ClosestPointResult with requested fields
+        
+        Example:
+            # Simple: just distances
+            distances = bvh.udf(points)
+            
+            # With extras
+            result = bvh.udf(points, return_closest=True)
+            print(result.distances, result.closest_points)
         """
         if return_grad:
-            return self._udf_with_grad(points)
+            result = self._udf_with_grad(points)
         else:
-            return self._udf_query(points)
+            result = self._udf_query(points)
+        
+        # If no extras requested, return tensor directly
+        if not return_closest and not return_uvw and not return_face_ids:
+            return result.distances
+        
+        # Filter result based on options
+        if not return_closest:
+            result.closest_points = None
+        if not return_uvw:
+            result.uvw = None
+        if not return_face_ids:
+            result.face_ids = None
+        
+        return result
     
     def _udf_query(self, points: torch.Tensor) -> ClosestPointResult:
         """UDF query without gradient."""
@@ -371,8 +441,11 @@ class MeshBVH:
     def sdf(
         self,
         points: torch.Tensor,
-        return_grad: bool = False
-    ) -> ClosestPointResult:
+        return_grad: bool = False,
+        return_closest: bool = False,
+        return_uvw: bool = False,
+        return_face_ids: bool = False
+    ) -> Union[torch.Tensor, ClosestPointResult]:
         """
         Signed Distance Field query.
         
@@ -382,15 +455,32 @@ class MeshBVH:
         Args:
             points: [N, 3] query points
             return_grad: If True, distances will have grad_fn
+            return_closest: If True, include closest_points in result
+            return_uvw: If True, include uvw barycentric coordinates in result
+            return_face_ids: If True, include face_ids in result
         
         Returns:
-            result: ClosestPointResult with signed distances
+            If all return_* are False: distances [N] tensor (signed)
+            Otherwise: ClosestPointResult with requested fields
         """
-        result = self.udf(points, return_grad=return_grad)
+        # Need full result for sign computation
+        result = self._udf_query(points) if not return_grad else self._udf_with_grad(points)
         
         # Compute sign using closest face normal
         signs = self._compute_sign(points, result.closest_points, result.face_ids)
         result.distances = result.distances * signs
+        
+        # If no extras requested, return tensor directly
+        if not return_closest and not return_uvw and not return_face_ids:
+            return result.distances
+        
+        # Filter result based on options
+        if not return_closest:
+            result.closest_points = None
+        if not return_uvw:
+            result.uvw = None
+        if not return_face_ids:
+            result.face_ids = None
         
         return result
     

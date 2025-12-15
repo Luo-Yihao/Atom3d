@@ -255,19 +255,30 @@ class OctreeIndexer(CubeGrid):
     
     def cube_aabb_level(
         self,
-        cube_ijk: torch.Tensor,
-        level: int
+        cubes: torch.Tensor,
+        level: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get cube AABB at specified level.
         
         Args:
-            cube_ijk: [B, 3]
-            level: int
+            cubes: [B, 3] ijk coordinates OR [B] linear indices
+            level: Octree level (default: max_level)
         
         Returns:
             aabb_min, aabb_max: [B, 3]
         """
+        if level is None:
+            level = self.max_level
+        
+        # Auto-detect format
+        if cubes.dim() == 2 and cubes.shape[1] == 3:
+            cube_ijk = cubes
+        elif cubes.dim() == 1:
+            cube_ijk = self.cube_to_ijk(cubes)
+        else:
+            raise ValueError(f"cubes must be [B, 3] ijk or [B] linear idx, got shape {cubes.shape}")
+        
         cell_size = self.get_cell_size(level)
         aabb_min = cube_ijk.float() * cell_size + self.bounds[0]
         aabb_max = aabb_min + cell_size

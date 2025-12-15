@@ -1,44 +1,44 @@
 """
 FloodFill: Flood fill for voxel connectivity analysis
+
+Used to distinguish interior/exterior voxels for solid voxelization.
 """
 
 from typing import Optional
 import torch
 
-from ..grid.grid_indexer import GridIndexer
+from ..grid.cube_grid import CubeGrid
 
 
 class FloodFill:
     """
-    泛洪填充应用
+    Flood fill application for connectivity analysis.
     
-    = GridIndexer + 连通性分析
-    
-    用于区分内部/外部体素
+    Uses CubeGrid for boundary checking and coordinate conversion.
     """
     
     @staticmethod
     def fill(
         voxel_coords: torch.Tensor,
-        grid: GridIndexer,
+        grid: CubeGrid,
         seed: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        连通分量标记
+        Connected component labeling via flood fill.
         
         Args:
-            voxel_coords: [N, 3] int32 占用的体素坐标
-            grid: GridIndexer（用于边界判断）
-            seed: [3] 种子点（默认[0,0,0]为外部）
+            voxel_coords: [N, 3] int32 occupied voxel coordinates
+            grid: CubeGrid (for boundary checking)
+            seed: [3] seed point (default [0,0,0] as exterior)
         
         Returns:
-            labels: [N] int32 连通分量标签
-                label=0 表示与seed连通的外部区域
-                label>0 表示内部连通分量（可能有多个）
+            labels: [N] int32 connected component labels
+                label=0 means connected to seed (exterior region)
+                label>0 means interior connected components (may have multiple)
         """
         N = voxel_coords.shape[0]
         device = voxel_coords.device
-        resolution = grid.resolution
+        resolution = grid.res
         
         if seed is None:
             seed = torch.tensor([0, 0, 0], device=device)
@@ -100,22 +100,23 @@ class FloodFill:
     @staticmethod
     def get_interior_voxels(
         voxel_coords: torch.Tensor,
-        grid: GridIndexer,
+        grid: CubeGrid,
         seed: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        获取内部体素坐标
+        Get interior voxel coordinates.
         
         Args:
-            voxel_coords: [N, 3] 表面体素坐标
-            grid: GridIndexer
-            seed: [3] 外部种子点
+            voxel_coords: [N, 3] surface voxel coordinates
+            grid: CubeGrid
+            seed: [3] exterior seed point
         
         Returns:
-            interior_coords: [K, 3] 内部体素坐标（不与外部连通的空体素）
+            interior_coords: [K, 3] interior voxel coordinates 
+                             (empty voxels not connected to exterior)
         """
         device = voxel_coords.device
-        resolution = grid.resolution
+        resolution = grid.res
         
         if seed is None:
             seed = torch.tensor([0, 0, 0], device=device)

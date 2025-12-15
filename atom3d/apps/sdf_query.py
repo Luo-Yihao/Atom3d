@@ -1,28 +1,30 @@
 """
 SDFQuery: Signed Distance Field query with multiple methods
+
+Provides SDF computation using winding number, flood fill, or ray stabbing.
 """
 
 from typing import Optional
 import torch
 
 from ..core.mesh_bvh import MeshBVH
-from ..grid.grid_indexer import GridIndexer
+from ..grid.cube_grid import CubeGrid
 from .flood_fill import FloodFill
 
 
 class SDFQuery:
     """
-    SDF查询应用
+    SDF query application.
     
-    = MeshBVH.query_closest_point + 全局符号算法
+    Combines MeshBVH.query_closest_point with sign determination algorithms.
     
-    支持多种SDF计算方法:
-    - winding: Winding number（精确，需要水密网格）
-    - flood: Flood fill（开放网格）
-    - raystab: Ray stabbing（鲁棒但慢）
+    Supported methods:
+        - winding: Winding number (exact, requires watertight mesh)
+        - flood: Flood fill (works with open meshes)
+        - raystab: Ray stabbing (robust but slow)
     
     Args:
-        bvh: MeshBVH实例
+        bvh: MeshBVH instance
     """
     
     def __init__(self, bvh: MeshBVH):
@@ -30,15 +32,15 @@ class SDFQuery:
     
     def query_winding(self, points: torch.Tensor) -> torch.Tensor:
         """
-        基于Winding Number的SDF
+        SDF via Winding Number.
         
         Args:
             points: [N, 3]
         
         Returns:
-            sdf: [N] float32 (内部为负，外部为正)
+            sdf: [N] float32 (negative inside, positive outside)
         
-        适用: 水密或近水密网格
+        Suitable for: watertight or near-watertight meshes
         """
         N = points.shape[0]
         device = points.device
@@ -61,9 +63,9 @@ class SDFQuery:
     
     def _compute_winding_number(self, points: torch.Tensor) -> torch.Tensor:
         """
-        Compute generalized winding number
+        Compute generalized winding number.
         
-        For each point, sum solid angles subtended by all triangles
+        For each point, sum solid angles subtended by all triangles.
         """
         N = points.shape[0]
         device = points.device
@@ -104,20 +106,20 @@ class SDFQuery:
         self,
         points: torch.Tensor,
         voxel_coords: torch.Tensor,
-        grid: GridIndexer
+        grid: CubeGrid
     ) -> torch.Tensor:
         """
-        基于Flood Fill的SDF
+        SDF via Flood Fill.
         
         Args:
             points: [N, 3]
-            voxel_coords: [K, 3] 表面体素坐标
-            grid: GridIndexer
+            voxel_coords: [K, 3] surface voxel coordinates
+            grid: CubeGrid
         
         Returns:
             sdf: [N] float32
         
-        适用: 开放网格
+        Suitable for: open meshes
         """
         # Get UDF
         result = self.bvh.query_closest_point(points, return_uvw=False)
@@ -128,7 +130,7 @@ class SDFQuery:
         
         # Convert points to grid coords and check labels
         grid_coords = grid.world_to_grid(points).floor().int()
-        grid_coords = grid_coords.clamp(0, grid.resolution - 1)
+        grid_coords = grid_coords.clamp(0, grid.res - 1)
         
         # Create lookup
         exterior_label = 0  # Connected to seed (assumed exterior)
@@ -149,19 +151,19 @@ class SDFQuery:
         seed: Optional[int] = None
     ) -> torch.Tensor:
         """
-        基于Ray Stabbing的SDF
+        SDF via Ray Stabbing.
         
-        从每个点发射多条射线，统计相交次数的奇偶性
+        Shoots multiple rays from each point and counts intersection parity.
         
         Args:
             points: [N, 3]
-            num_rays: 每个点发射的射线数量
-            seed: 随机种子
+            num_rays: Number of rays per point
+            seed: Random seed
         
         Returns:
             sdf: [N] float32
         
-        适用: 开放、非流形网格
+        Suitable for: open, non-manifold meshes
         """
         N = points.shape[0]
         device = points.device
