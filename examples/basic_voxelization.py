@@ -54,31 +54,14 @@ def main():
     print(f"\n[2] Creating octree (level {max_level}, res {2**max_level})...")
     octree = OctreeIndexer(max_level=max_level, device=device)
     
-    # Get face AABBs
-    face_min, face_max = bvh.get_face_aabb()
-    
-    # Octree traversal (broadphase)
-    print("\n[3] Octree traversal (broadphase)...")
+    # Octree traversal using BVH-accelerated broadphase
+    print("\n[3] Octree traversal (BVH-accelerated broadphase)...")
     t0 = time.time()
     
     min_level = 4
-    current = octree.all_cubes_at_level(min_level)
+    candidates = octree.octree_traverse(bvh, min_level=min_level)
     
-    for level in range(min_level, max_level + 1):
-        cube_min, cube_max = octree.cube_aabb_level(current, level)
-        
-        # AABB-AABB overlap
-        overlap = (cube_min[:, None, :] <= face_max[None, :, :]) & \
-                  (cube_max[:, None, :] >= face_min[None, :, :])
-        active = overlap.all(dim=2).any(dim=1)
-        current = current[active]
-        
-        print(f"    Level {level}: {len(current)} candidates")
-        
-        if level < max_level and len(current) > 0:
-            current = octree.subdivide(current, level)
-    
-    candidates = current
+    print(f"    Candidates at level {max_level}: {len(candidates)}")
     print(f"    Broadphase time: {time.time()-t0:.3f}s")
     
     # SAT intersection (narrowphase)
@@ -100,8 +83,8 @@ def main():
     corners = octree.cube_corner_coords_level(surface_voxels[:100], max_level)  # First 100
     corner_points = corners.reshape(-1, 3)
     
-    udf_result = bvh.udf(corner_points)
-    print(f"    UDF range: [{udf_result.distances.min():.4f}, {udf_result.distances.max():.4f}]")
+    udf_distances = bvh.udf(corner_points)  # Returns tensor directly when no extras requested
+    print(f"    UDF range: [{udf_distances.min():.4f}, {udf_distances.max():.4f}]")
     print(f"    UDF time: {time.time()-t0:.3f}s")
     
     # Polygon clipping (mode 2)

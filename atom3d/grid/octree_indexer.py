@@ -5,8 +5,11 @@ Inherits from CubeGrid to provide cube vertex/edge/face indexing
 at multiple resolution levels.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, TYPE_CHECKING
 import torch
+
+if TYPE_CHECKING:
+    from atom3d.core import MeshBVH
 from .cube_grid import CubeGrid
 
 
@@ -361,26 +364,29 @@ class OctreeIndexer(CubeGrid):
     
     def octree_traverse(
         self,
-        mesh_aabb_min: torch.Tensor,
-        mesh_aabb_max: torch.Tensor,
+        bvh: "MeshBVH",
         min_level: int = 2
     ) -> torch.Tensor:
         """
-        Octree traversal: coarse-to-fine active node discovery.
+        Octree traversal: coarse-to-fine active node discovery using BVH acceleration.
+        
+        Uses BVH's intersect_aabb for O(N log M) broadphase instead of 
+        brute-force O(N × M) comparison.
         
         Args:
-            mesh_aabb_min: [M, 3] mesh triangle AABB min
-            mesh_aabb_max: [M, 3] mesh triangle AABB max
-            min_level: Starting level
+            bvh: MeshBVH instance for triangle-AABB intersection
+            min_level: Starting level for traversal
         
         Returns:
             active_cubes: [K, 3] active cube ijk at max level
         """
         # Start from min_level
         current_cubes = self.all_cubes_at_level(min_level)
-        current_cubes = self.filter_active_cubes(
-            current_cubes, min_level, mesh_aabb_min, mesh_aabb_max
-        )
+        
+        # Initial filter at min_level
+        cube_min, cube_max = self.cube_aabb_level(current_cubes, min_level)
+        result = bvh.intersect_aabb(cube_min, cube_max, mode=0)
+        current_cubes = current_cubes[result.hit]
         
         # Refine level by level
         for level in range(min_level + 1, self.max_level + 1):
@@ -390,9 +396,9 @@ class OctreeIndexer(CubeGrid):
             # Subdivide
             current_cubes = self.subdivide(current_cubes, level - 1)
             
-            # Filter
-            current_cubes = self.filter_active_cubes(
-                current_cubes, level, mesh_aabb_min, mesh_aabb_max
-            )
+            # Filter using BVH broadphase (mode=0 = hit mask only)
+            cube_min, cube_max = self.cube_aabb_level(current_cubes, level)
+            result = bvh.intersect_aabb(cube_min, cube_max, mode=0)
+            current_cubes = current_cubes[result.hit]
         
         return current_cubes

@@ -55,12 +55,11 @@ bvh = MeshBVH(vertices.cuda(), faces.cuda(), device='cuda')
 # Create octree (256³ max resolution)
 octree = OctreeIndexer(max_level=8, device='cuda')
 
-# Broadphase: octree traversal to find candidate voxels
-face_min, face_max = bvh.get_face_aabb()
-candidates = octree.octree_traverse(face_min, face_max, min_level=4)
+# Broadphase: octree traversal using BVH-accelerated intersection
+candidates = octree.octree_traverse(bvh, min_level=4)
 
-# Narrowphase: precise SAT intersection
-voxel_min, voxel_max = octree.cube_aabb_level(candidates, level=8)
+# Narrowphase: precise SAT intersection (optional, for polygon clipping)
+voxel_min, voxel_max = octree.cube_aabb_level(candidates)
 result = bvh.intersect_aabb(voxel_min, voxel_max, mode=1)
 surface_voxels = candidates[result.hit]
 ```
@@ -123,7 +122,7 @@ result = bvh.intersect_ray(rays_o, rays_d)
 
 | Method | Description |
 |--------|-------------|
-| `octree_traverse(aabb_min, aabb_max, min_level)` | Hierarchical broadphase |
+| `octree_traverse(bvh, min_level)` | BVH-accelerated hierarchical broadphase |
 | `cube_aabb_level(cubes, level)` | Get voxel AABB at level |
 | `ijk_to_cube(ijk)` | Grid coords to linear index |
 | `cube_to_ijk(idx)` | Linear index to grid coords |
