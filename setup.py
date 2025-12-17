@@ -28,7 +28,6 @@ setup(
         ],
         "full": [
             "trimesh>=3.0",
-            "cubvh>=0.1.0",
         ],
     },
     classifiers=[

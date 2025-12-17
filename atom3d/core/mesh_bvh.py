@@ -28,12 +28,13 @@ try:
 except ImportError:
     HAS_CUDA = False
 
-# Try to import cubvh for BVH acceleration
+# Try to import internal BVH accelerator
 try:
-    import cubvh
-    HAS_CUBVH = True
+    from ..kernels.bvh import BVHAccelerator, bvh_available
+    HAS_BVH = bvh_available()
 except ImportError:
-    HAS_CUBVH = False
+    HAS_BVH = False
+    BVHAccelerator = None
 
 
 class MeshBVH:
@@ -79,13 +80,13 @@ class MeshBVH:
     
     def _build_bvh(self):
         """Build BVH acceleration structure."""
-        if HAS_CUBVH and self.device == 'cuda':
+        self._bvh = None
+        if HAS_BVH and self.device == 'cuda':
             try:
-                self._bvh = cubvh.cuBVH(self.vertices, self.faces)
-            except:
+                self._bvh = BVHAccelerator(self.vertices, self.faces)
+            except Exception as e:
+                print(f"BVH build failed: {e}")
                 self._bvh = None
-        else:
-            self._bvh = None
     
     def _get_face_verts_flat(self) -> torch.Tensor:
         """Get flattened triangle vertices [M, 9] for SAT clip kernel."""
@@ -175,7 +176,28 @@ class MeshBVH:
         aabb_max: torch.Tensor,
         return_pairs: bool
     ) -> AABBIntersectResult:
-        """Basic SAT intersection (mode 0/1)."""
+        """Basic SAT intersection (mode 0/1).
+        
+        Uses BVH-accelerated exact SAT test when available (O(N log M)).
+        Falls back to brute-force CUDA kernel (O(N × M)).
+        """
+        N = aabb_min.shape[0]
+        device = aabb_min.device
+        
+        # Use internal BVH (O(N log M))
+        if self._bvh is not None:
+            try:
+                hit_mask, aabb_ids, face_ids = self._bvh.aabb_intersect(
+                    aabb_min.contiguous(), aabb_max.contiguous()
+                )
+                if return_pairs:
+                    return AABBIntersectResult(hit=hit_mask, aabb_ids=aabb_ids, face_ids=face_ids)
+                else:
+                    return AABBIntersectResult(hit=hit_mask)
+            except Exception as e:
+                print(f"BVH AABB intersect failed: {e}")
+        
+        # Fallback: brute-force CUDA kernel (O(N × M))
         if HAS_CUDA and self.device == 'cuda':
             try:
                 hit_mask, aabb_ids, face_ids = triangle_aabb_intersect(
@@ -198,14 +220,30 @@ class MeshBVH:
         aabb_max: torch.Tensor,
         mode: int
     ) -> AABBIntersectResult:
-        """SAT with polygon clipping (mode 2/3)."""
+        """SAT with polygon clipping (mode 2/3).
+        
+        Uses BVH for fast broadphase, then sat_clip_polygon kernel for exact clipping.
+        """
         N = aabb_min.shape[0]
         device = aabb_min.device
         
-        # Use CUDA SAT kernel for fast broadphase (deterministic)
-        if HAS_CUDA and self.device == 'cuda':
+        # Use BVH for fast broadphase (O(N log M) instead of O(N×M))
+        if self._bvh is not None:
             try:
-                # Get candidate pairs from SAT kernel
+                hit_mask, cand_a, cand_t = self._bvh.aabb_intersect(
+                    aabb_min.contiguous(), aabb_max.contiguous()
+                )
+                
+                if cand_a.numel() == 0:
+                    return AABBIntersectResult(
+                        hit=torch.zeros(N, dtype=torch.bool, device=device)
+                    )
+            except Exception as e:
+                print(f"BVH broadphase failed: {e}, falling back to brute-force")
+                cand_a, cand_t = self._get_candidates_bruteforce(aabb_min, aabb_max)
+        elif HAS_CUDA and self.device == 'cuda':
+            # Fallback: brute-force CUDA kernel
+            try:
                 hit_mask, cand_a, cand_t = triangle_aabb_intersect(
                     self.vertices, self.faces,
                     aabb_min.contiguous(), aabb_max.contiguous()
@@ -216,7 +254,7 @@ class MeshBVH:
                         hit=torch.zeros(N, dtype=torch.bool, device=device)
                     )
             except Exception as e:
-                print(f"CUDA SAT kernel failed, falling back to chunked: {e}")
+                print(f"CUDA SAT kernel failed: {e}")
                 cand_a, cand_t = self._chunked_broadphase(aabb_min, aabb_max)
         else:
             cand_a, cand_t = self._chunked_broadphase(aabb_min, aabb_max)
@@ -309,6 +347,23 @@ class MeshBVH:
         
         return torch.cat(all_cand_a), torch.cat(all_cand_t)
     
+    def _get_candidates_bruteforce(
+        self,
+        aabb_min: torch.Tensor,
+        aabb_max: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get candidate pairs using brute-force SAT kernel."""
+        if HAS_CUDA and self.device == 'cuda':
+            try:
+                hit_mask, cand_a, cand_t = triangle_aabb_intersect(
+                    self.vertices, self.faces,
+                    aabb_min.contiguous(), aabb_max.contiguous()
+                )
+                return cand_a, cand_t
+            except Exception as e:
+                print(f"Brute-force SAT failed: {e}")
+        return self._chunked_broadphase(aabb_min, aabb_max)
+    
     def _intersect_aabb_pytorch(
         self,
         aabb_min: torch.Tensor,
@@ -393,6 +448,20 @@ class MeshBVH:
         N = points.shape[0]
         device = points.device
         
+        # Use internal BVH (O(N log M))
+        if self._bvh is not None:
+            try:
+                distances, face_ids, closest_points, uvw = self._bvh.udf(points.contiguous())
+                return ClosestPointResult(
+                    distances=distances,
+                    face_ids=face_ids,
+                    closest_points=closest_points,
+                    uvw=uvw
+                )
+            except Exception as e:
+                print(f"BVH UDF failed: {e}")
+        
+        # Fallback: brute-force CUDA kernel (O(N × M))
         if HAS_CUDA and self.device == 'cuda':
             try:
                 distances, face_ids, closest_points, uvw = point_mesh_udf(
@@ -406,18 +475,6 @@ class MeshBVH:
                 )
             except Exception as e:
                 print(f"CUDA UDF kernel failed: {e}")
-        
-        if HAS_CUBVH and self._bvh is not None:
-            distances, face_ids, closest_points = self._bvh.unsigned_distance(
-                points, return_uvw=False
-            )
-            uvw = self._compute_barycentric(points, closest_points, face_ids)
-            return ClosestPointResult(
-                distances=distances,
-                face_ids=face_ids,
-                closest_points=closest_points,
-                uvw=uvw
-            )
         
         return self._udf_bruteforce(points)
     
@@ -636,6 +693,27 @@ class MeshBVH:
         N = rays_o.shape[0]
         device = rays_o.device
         
+        # Use internal BVH (O(N log M))
+        if self._bvh is not None:
+            try:
+                hit_mask, hit_t, face_ids, hit_points = self._bvh.ray_intersect(
+                    rays_o.contiguous(), rays_d.contiguous(), max_t
+                )
+                normals = self._compute_normals_from_faces(face_ids, hit_mask)
+                bary_coords = torch.zeros(N, 3, device=device)
+                
+                return RayIntersectResult(
+                    hit=hit_mask,
+                    t=hit_t,
+                    face_ids=face_ids,
+                    hit_points=hit_points,
+                    normals=normals,
+                    bary_coords=bary_coords
+                )
+            except Exception as e:
+                print(f"BVH ray intersect failed: {e}")
+        
+        # Fallback: brute-force CUDA kernel (O(N × M))
         if HAS_CUDA and self.device == 'cuda':
             try:
                 from ..kernels import ray_mesh_intersect
@@ -660,19 +738,6 @@ class MeshBVH:
                 )
             except Exception as e:
                 print(f"CUDA ray kernel failed: {e}")
-        
-        if HAS_CUBVH and self._bvh is not None:
-            positions, face_ids, depth = self._bvh.ray_trace(rays_o, rays_d)
-            hit = face_ids >= 0
-            t = depth.clone()
-            t[~hit] = float('inf')
-            normals = self._compute_normals_from_faces(face_ids, hit)
-            bary_coords = torch.zeros(N, 3, device=device)
-            
-            return RayIntersectResult(
-                hit=hit, t=t, face_ids=face_ids,
-                hit_points=positions, normals=normals, bary_coords=bary_coords
-            )
         
         # Fallback
         return self._intersect_ray_bruteforce(rays_o, rays_d, max_t)
