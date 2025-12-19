@@ -13,6 +13,10 @@ class AABBIntersectResult:
     hit: torch.Tensor           # [N] bool 每个AABB是否有碰撞
     aabb_ids: Optional[torch.Tensor] = None   # [total_hits] int32 碰撞的AABB索引
     face_ids: Optional[torch.Tensor] = None   # [total_hits] int32 碰撞的面索引
+    centroids: Optional[torch.Tensor] = None
+    areas: Optional[torch.Tensor] = None
+    poly_verts: Optional[torch.Tensor] = None
+    poly_counts: Optional[torch.Tensor] = None
 
 
 @dataclass
