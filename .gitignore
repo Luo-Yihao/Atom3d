@@ -1,4 +1,4 @@
 *.pyc
 atom3d/kernels/build/*
 atom3d.egg-info/*
-core
+
