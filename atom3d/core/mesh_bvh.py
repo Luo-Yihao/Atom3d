@@ -58,8 +58,19 @@ class MeshBVH:
         self,
         vertices: torch.Tensor,
         faces: torch.Tensor,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        face_normals: Optional[torch.Tensor] = None,
+        vertex_normals: Optional[torch.Tensor] = None
     ):
+        """Initialize MeshBVH with optional pre-computed normals.
+        
+        Args:
+            vertices: [V, 3] mesh vertices
+            faces: [F, 3] mesh face indices
+            device: 'cuda' or 'cpu'
+            face_normals: [F, 3] pre-computed face normals (optional, will compute if None)
+            vertex_normals: [V, 3] pre-computed vertex normals (optional, will compute if None)
+        """
         self.vertices = vertices.to(device).float()
         self.faces = faces.to(device).int()
         self.device = device
@@ -75,6 +86,18 @@ class MeshBVH:
         # Precompute face vertices for SAT clip
         self._face_verts_flat = None
         
+        # Precompute or store face normals (FV)
+        if face_normals is not None:
+            self._face_normals = face_normals.to(device).float()
+        else:
+            self._face_normals = self._precompute_face_normals()
+        
+        # Precompute or store vertex normals (NV)
+        if vertex_normals is not None:
+            self._vertex_normals = vertex_normals.to(device).float()
+        else:
+            self._vertex_normals = None  # Lazy compute if needed
+        
         # Build BVH
         self._build_bvh()
     
@@ -87,6 +110,18 @@ class MeshBVH:
             except Exception as e:
                 print(f"BVH build failed: {e}")
                 self._bvh = None
+    
+    def _precompute_face_normals(self) -> torch.Tensor:
+        """Precompute face normals for all faces.
+        
+        Returns:
+            face_normals: [F, 3] normalized face normals
+        """
+        tri_verts = self.vertices[self.faces]  # [F, 3, 3]
+        v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
+        normals = torch.cross(v1 - v0, v2 - v0, dim=1)
+        normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-8)
+        return normals
     
     def _get_face_verts_flat(self) -> torch.Tensor:
         """Get flattened triangle vertices [M, 9] for SAT clip kernel."""
@@ -105,6 +140,24 @@ class MeshBVH:
             bounds: [2, 3] [[min_xyz], [max_xyz]]
         """
         return self._bounds
+    
+    def get_face_normals(self) -> torch.Tensor:
+        """
+        Get pre-computed face normals.
+        
+        Returns:
+            face_normals: [F, 3] normalized face normals
+        """
+        return self._face_normals
+    
+    def get_vertex_normals(self) -> Optional[torch.Tensor]:
+        """
+        Get pre-computed vertex normals (if available).
+        
+        Returns:
+            vertex_normals: [V, 3] normalized vertex normals or None
+        """
+        return self._vertex_normals
     
     def get_face_aabb(
         self, 
@@ -547,19 +600,17 @@ class MeshBVH:
         closest_points: torch.Tensor,
         face_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Compute SDF sign based on face normal."""
+        """Compute SDF sign based on cached face normals."""
         device = points.device
         N = points.shape[0]
         
-        # Get face normals
+        # Get cached face normals
         valid = face_ids >= 0
         signs = torch.ones(N, device=device)
         
         if valid.any():
-            tri_verts = self.vertices[self.faces[face_ids[valid]]]
-            v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
-            normals = torch.cross(v1 - v0, v2 - v0, dim=1)
-            normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-8)
+            # Use cached face normals instead of recomputing
+            normals = self._face_normals[face_ids[valid]]
             
             # Sign = dot(point - closest, normal)
             to_point = points[valid] - closest_points[valid]
@@ -747,18 +798,18 @@ class MeshBVH:
         face_ids: torch.Tensor, 
         valid_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Compute normals from face indices."""
+        """Get normals from cached face normals using face indices.
+        
+        Note: Now uses pre-computed face normals instead of recomputing.
+        """
         N = face_ids.shape[0]
         device = face_ids.device
         normals = torch.zeros(N, 3, device=device)
         
         if valid_mask.any():
             valid_faces = face_ids[valid_mask]
-            tri_verts = self.vertices[self.faces[valid_faces]]
-            v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
-            face_normals = torch.cross(v1 - v0, v2 - v0, dim=1)
-            face_normals = face_normals / (face_normals.norm(dim=1, keepdim=True) + 1e-8)
-            normals[valid_mask] = face_normals
+            # Use cached face normals instead of recomputing
+            normals[valid_mask] = self._face_normals[valid_faces]
         
         return normals
     
