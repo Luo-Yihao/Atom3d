@@ -145,6 +145,7 @@ __global__ void triangle_aabb_intersect_kernel(
     const float* __restrict__ aabb_max,     // [K, 3]
     int num_faces,
     int num_aabbs,
+    int max_hits,                           // P0-3 FIX: max output capacity
     bool* __restrict__ hit_mask,            // [K]
     int* __restrict__ aabb_ids,             // [max_hits] output pairs
     int* __restrict__ face_ids,             // [max_hits]
@@ -172,9 +173,12 @@ __global__ void triangle_aabb_intersect_kernel(
     if (triangle_aabb_sat(v0, v1, v2, box_min, box_max)) {
         hit_mask[aabb_idx] = true;
         
+        // P0-3 FIX: Bounds check before write to prevent memory overwrite
         int write_idx = atomicAdd(hit_counter, 1);
-        aabb_ids[write_idx] = aabb_idx;
-        face_ids[write_idx] = face_idx;
+        if (write_idx < max_hits) {
+            aabb_ids[write_idx] = aabb_idx;
+            face_ids[write_idx] = face_idx;
+        }
     }
 }
 
@@ -318,28 +322,26 @@ __global__ void sat_clip_polygon_kernel(
     const float nxp[3] = {1, 0, 0}, nyp[3] = {0, 1, 0}, nzp[3] = {0, 0, 1};
     const float nxn[3] = {-1, 0, 0}, nyn[3] = {0, -1, 0}, nzn[3] = {0, 0, -1};
     
-    auto clip_once = [&](const float inP[MAX_CLIP_VERTS][3], int inN, 
-                         const float n[3], float d, float outP[MAX_CLIP_VERTS][3]) -> int {
-        return clip_with_plane<MAX_CLIP_VERTS>(inP, inN, n, d, outP, eps);
-    };
+    // P0-1 FIX: Replaced lambda with direct macro to avoid CUDA compatibility issues
+    #define CLIP_ONCE(inP, inN, n, d, outP) clip_with_plane<MAX_CLIP_VERTS>(inP, inN, n, d, outP, eps)
     
     int nB;
-    nB = clip_once(polyA, nA, nxp, bmax[0], polyB); nA = nB;
+    nB = CLIP_ONCE(polyA, nA, nxp, bmax[0], polyB); nA = nB;
     if (!nA) { hit_mask[k] = false; poly_counts[k] = 0; areas[k] = 0; return; }
     
-    nB = clip_once(polyB, nA, nxn, -bmin[0], polyA); nA = nB;
+    nB = CLIP_ONCE(polyB, nA, nxn, -bmin[0], polyA); nA = nB;
     if (!nA) { hit_mask[k] = false; poly_counts[k] = 0; areas[k] = 0; return; }
     
-    nB = clip_once(polyA, nA, nyp, bmax[1], polyB); nA = nB;
+    nB = CLIP_ONCE(polyA, nA, nyp, bmax[1], polyB); nA = nB;
     if (!nA) { hit_mask[k] = false; poly_counts[k] = 0; areas[k] = 0; return; }
     
-    nB = clip_once(polyB, nA, nyn, -bmin[1], polyA); nA = nB;
+    nB = CLIP_ONCE(polyB, nA, nyn, -bmin[1], polyA); nA = nB;
     if (!nA) { hit_mask[k] = false; poly_counts[k] = 0; areas[k] = 0; return; }
     
-    nB = clip_once(polyA, nA, nzp, bmax[2], polyB); nA = nB;
+    nB = CLIP_ONCE(polyA, nA, nzp, bmax[2], polyB); nA = nB;
     if (!nA) { hit_mask[k] = false; poly_counts[k] = 0; areas[k] = 0; return; }
     
-    nA = clip_once(polyB, nB, nzn, -bmin[2], polyA);
+    nA = CLIP_ONCE(polyB, nB, nzn, -bmin[2], polyA);
     if (!nA) { hit_mask[k] = false; poly_counts[k] = 0; areas[k] = 0; return; }
     
     // Hit!
@@ -364,6 +366,7 @@ __global__ void sat_clip_polygon_kernel(
     }
     
     if (cnt < 1) {
+        hit_mask[k] = false;  // CRITICAL FIX: No intersection if polygon degenerates  
         areas[k] = 0;
         centroids[k * 3 + 0] = 0;
         centroids[k * 3 + 1] = 0;
@@ -403,6 +406,15 @@ __global__ void sat_clip_polygon_kernel(
     float d21 = vx * e2x + vy * e2y + vz * e2z;
     float denom = d00 * d11 - d01 * d01;
     
+    // P0 FIX: Guard against degenerate triangle (denom near zero -> NaN/Inf)
+    if (fabsf(denom) < eps * eps) {
+        // Fallback: use first vertex as centroid for degenerate triangles
+        centroids[k * 3 + 0] = ax;
+        centroids[k * 3 + 1] = ay;
+        centroids[k * 3 + 2] = az;
+        return;
+    }
+    
     float v_bc = (d11 * d20 - d01 * d21) / denom;
     float w_bc = (d00 * d21 - d01 * d20) / denom;
     float u_bc = 1.0f - v_bc - w_bc;
@@ -435,6 +447,13 @@ __global__ void sat_clip_polygon_kernel(
         area += 0.5f * sqrtf(cross_x * cross_x + cross_y * cross_y + cross_z * cross_z);
     }
     areas[k] = area;
+    
+    // NOTE: For area < eps (point/line contact), we keep hit_mask=true
+    // because contact counts as collision. Only set area=0 explicitly.
+    if (area < eps) {
+        areas[k] = 0.0f;  // Explicit zero for degenerate cases
+        // hit_mask stays true - contact counts as collision
+    }
 }
 
 // ============================================================
@@ -688,6 +707,7 @@ __global__ void segment_tri_intersection_kernel(
     const float* __restrict__ tri_aabb_max, // [N_tri, 3]
     int num_segs,
     int num_tris,
+    int max_hits,  // P0 FIX: max output capacity
     float eps,
     long* __restrict__ out_seg_ids,
     long* __restrict__ out_tri_ids,
@@ -707,7 +727,13 @@ __global__ void segment_tri_intersection_kernel(
     float3 seg_max = make_float3(
         fmaxf(p0.x, p1.x), fmaxf(p0.y, p1.y), fmaxf(p0.z, p1.z)
     );
-    float3 ray_d = sub3(p1, p0);
+    
+    // FIX: Normalize ray direction for correct t interpretation
+    float3 dir = sub3(p1, p0);
+    float seg_len = length3(dir);
+    if (seg_len <= eps) return;  // Skip zero-length segments
+    float inv_len = 1.0f / seg_len;
+    float3 ray_d = make_float3(dir.x * inv_len, dir.y * inv_len, dir.z * inv_len);
     
     extern __shared__ float smem[];
     float* tri_min_tile = smem;
@@ -745,13 +771,19 @@ __global__ void segment_tri_intersection_kernel(
                 float3 v2 = make_float3_from_ptr(tri_verts + current_tri * 9 + 6);
                 
                 float u, v;
-                float t = ray_triangle_intersect(p0, ray_d, v0, v1, v2, &u, &v);
+                float t_dist = ray_triangle_intersect(p0, ray_d, v0, v1, v2, &u, &v);
                 
-                if (t >= 0 && t <= 1.0f) {
+                // FIX: Use distance-based check (t_dist is actual distance since ray_d is normalized)
+                float t_eps = 1e-6f;
+                if (t_dist >= -t_eps && t_dist <= seg_len + t_eps) {
+                    float t_seg = t_dist * inv_len;  // Convert to [0,1] segment parameter
+                    // P0 FIX: Bounds check before write
                     int write_idx = atomicAdd(counter, 1);
-                    out_seg_ids[write_idx] = seg_idx;
-                    out_tri_ids[write_idx] = current_tri;
-                    out_t[write_idx] = t;
+                    if (write_idx < max_hits) {
+                        out_seg_ids[write_idx] = seg_idx;
+                        out_tri_ids[write_idx] = current_tri;
+                        out_t[write_idx] = t_seg;  // Store normalized segment parameter
+                    }
                 }
             }
         }
@@ -781,6 +813,12 @@ std::vector<at::Tensor> triangle_aabb_intersect_cuda(
     CHECK_INPUT(aabb_min);
     CHECK_INPUT(aabb_max);
     
+    // P0-2 FIX: Enforce strict dtype checks to prevent memory corruption
+    TORCH_CHECK(vertices.scalar_type() == at::kFloat, "vertices must be float32");
+    TORCH_CHECK(faces.scalar_type() == at::kInt, "faces must be int32, got ", faces.scalar_type());
+    TORCH_CHECK(aabb_min.scalar_type() == at::kFloat, "aabb_min must be float32");
+    TORCH_CHECK(aabb_max.scalar_type() == at::kFloat, "aabb_max must be float32");
+    
     int num_faces = faces.size(0);
     int num_aabbs = aabb_min.size(0);
     
@@ -808,6 +846,7 @@ std::vector<at::Tensor> triangle_aabb_intersect_cuda(
         aabb_max.data_ptr<float>(),
         num_faces,
         num_aabbs,
+        (int)max_hits,  // P0-3 FIX: Pass max_hits for bounds check
         hit_mask.data_ptr<bool>(),
         aabb_ids.data_ptr<int>(),
         face_ids.data_ptr<int>(),
@@ -837,6 +876,12 @@ std::vector<at::Tensor> ray_mesh_intersect_cuda(
     CHECK_INPUT(faces);
     CHECK_INPUT(rays_o);
     CHECK_INPUT(rays_d);
+    
+    // P0-2 FIX: dtype validation
+    TORCH_CHECK(vertices.scalar_type() == at::kFloat, "vertices must be float32");
+    TORCH_CHECK(faces.scalar_type() == at::kInt, "faces must be int32, got ", faces.scalar_type());
+    TORCH_CHECK(rays_o.scalar_type() == at::kFloat, "rays_o must be float32");
+    TORCH_CHECK(rays_d.scalar_type() == at::kFloat, "rays_d must be float32");
     
     int num_faces = faces.size(0);
     int num_rays = rays_o.size(0);
@@ -884,6 +929,11 @@ std::vector<at::Tensor> point_mesh_udf_cuda(
     CHECK_INPUT(faces);
     CHECK_INPUT(points);
     
+    // P0-2 FIX: dtype validation
+    TORCH_CHECK(vertices.scalar_type() == at::kFloat, "vertices must be float32");
+    TORCH_CHECK(faces.scalar_type() == at::kInt, "faces must be int32, got ", faces.scalar_type());
+    TORCH_CHECK(points.scalar_type() == at::kFloat, "points must be float32");
+    
     int num_faces = faces.size(0);
     int num_points = points.size(0);
     
@@ -928,6 +978,12 @@ std::vector<at::Tensor> segment_tri_intersect_cuda(
     CHECK_INPUT(tri_aabb_min);
     CHECK_INPUT(tri_aabb_max);
     
+    // P0-2 FIX: dtype validation
+    TORCH_CHECK(seg_verts.scalar_type() == at::kFloat, "seg_verts must be float32");
+    TORCH_CHECK(tri_verts.scalar_type() == at::kFloat, "tri_verts must be float32");
+    TORCH_CHECK(tri_aabb_min.scalar_type() == at::kFloat, "tri_aabb_min must be float32");
+    TORCH_CHECK(tri_aabb_max.scalar_type() == at::kFloat, "tri_aabb_max must be float32");
+    
     int num_segs = seg_verts.size(0);
     int num_tris = tri_verts.size(0);
     
@@ -953,6 +1009,7 @@ std::vector<at::Tensor> segment_tri_intersect_cuda(
         tri_aabb_max.data_ptr<float>(),
         num_segs,
         num_tris,
+        (int)max_hits,  // P0 FIX: pass max_hits for bounds check
         eps,
         out_seg_ids.data_ptr<long>(),
         out_tri_ids.data_ptr<long>(),
@@ -992,6 +1049,13 @@ std::vector<at::Tensor> sat_clip_polygon_cuda(
     CHECK_INPUT(tris_verts);
     CHECK_INPUT(cand_a);
     CHECK_INPUT(cand_t);
+    
+    // P0-2 FIX: dtype validation
+    TORCH_CHECK(aabbs_min.scalar_type() == at::kFloat, "aabbs_min must be float32");
+    TORCH_CHECK(aabbs_max.scalar_type() == at::kFloat, "aabbs_max must be float32");
+    TORCH_CHECK(tris_verts.scalar_type() == at::kFloat, "tris_verts must be float32");
+    TORCH_CHECK(cand_a.scalar_type() == at::kLong, "cand_a must be int64");
+    TORCH_CHECK(cand_t.scalar_type() == at::kLong, "cand_t must be int64");
     
     int64_t K = cand_a.size(0);
     

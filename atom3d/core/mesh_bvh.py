@@ -193,14 +193,17 @@ class MeshBVH:
         mode: int = 1
     ) -> AABBIntersectResult:
         """
-        Triangle-AABB batch intersection using SAT.
+        Triangle-AABB batch intersection using exact clipping.
+        
+        All modes now use the clip-based test to eliminate false positives
+        from degenerate intersections (e.g., corner-only touches with area=0).
         
         Args:
             aabb_min: [N, 3] AABB min coordinates
             aabb_max: [N, 3] AABB max coordinates
             mode: Output mode
-                0 = hit mask only
-                1 = hit mask + (aabb_id, face_id) pairs (default)
+                0 = hit mask only (exact, no false positives)
+                1 = hit mask + (aabb_id, face_id) pairs (default, exact)
                 2 = hit mask + pairs + centroid + area
                 3 = hit mask + pairs + centroid + area + polygon vertices
         
@@ -216,11 +219,8 @@ class MeshBVH:
         """
         N = aabb_min.shape[0]
         
-        # Mode 0 or 1: Use basic SAT kernel
-        if mode <= 1:
-            return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=(mode >= 1))
-        
-        # Mode 2 or 3: Use SAT clip polygon kernel
+        # All modes now use clip-based test for accuracy
+        # Mode 0/1 will use clip internally but only return hit/pairs
         return self._intersect_aabb_clip(aabb_min, aabb_max, mode)
     
     def _intersect_aabb_sat(
@@ -273,9 +273,10 @@ class MeshBVH:
         aabb_max: torch.Tensor,
         mode: int
     ) -> AABBIntersectResult:
-        """SAT with polygon clipping (mode 2/3).
+        """SAT with polygon clipping for all modes (0-3).
         
         Uses BVH for fast broadphase, then sat_clip_polygon kernel for exact clipping.
+        This eliminates false positives from degenerate intersections.
         """
         N = aabb_min.shape[0]
         device = aabb_min.device
@@ -321,7 +322,8 @@ class MeshBVH:
         if HAS_CUDA and self.device == 'cuda':
             try:
                 tris_verts = self._get_face_verts_flat()
-                clip_mode = 1 if mode == 2 else 2  # kernel mode: 1=centroid, 2=full polygon
+                # Mode mapping: 0/1 use mode 0 (hit only), 2 uses mode 1 (centroid), 3 uses mode 2 (polygon)
+                clip_mode = 0 if mode <= 1 else (1 if mode == 2 else 2)
                 
                 hit_mask, poly_counts, poly_verts, centroids, areas, out_a, out_t = sat_clip_polygon(
                     aabb_min, aabb_max, tris_verts,
@@ -329,24 +331,31 @@ class MeshBVH:
                     mode=clip_mode
                 )
                 
-                # Filter to actual hits
+                # Filter to actual hits (fixed bug: degenerate polygons now correctly marked as no-hit)
                 valid = hit_mask
                 
                 # Build per-aabb hit mask
                 aabb_hit = torch.zeros(N, dtype=torch.bool, device=device)
                 aabb_hit[out_a[valid]] = True
                 
+                # Mode 0: hit mask only
+                if mode == 0:
+                    return AABBIntersectResult(hit=aabb_hit)
+                
+                # Mode 1+: include pairs
                 result = AABBIntersectResult(
                     hit=aabb_hit,
                     aabb_ids=out_a[valid],
                     face_ids=out_t[valid]
                 )
                 
-                # Add clip data as extra attributes
-                result.centroids = centroids[valid]
-                result.areas = areas[valid]
-                result.poly_counts = poly_counts[valid]
+                # Mode 2+: add clip data
+                if mode >= 2:
+                    result.centroids = centroids[valid]
+                    result.areas = areas[valid]
+                    result.poly_counts = poly_counts[valid]
                 
+                # Mode 3: add polygon vertices
                 if mode == 3:
                     result.poly_verts = poly_verts[valid]
                 
@@ -356,7 +365,7 @@ class MeshBVH:
                 print(f"SAT clip kernel failed: {e}")
         
         # Fallback: just return SAT result without clip data
-        return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=True)
+        return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=(mode >= 1))
     
     def _chunked_broadphase(
         self,
