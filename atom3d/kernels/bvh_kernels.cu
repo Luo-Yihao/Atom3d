@@ -132,36 +132,54 @@ struct Triangle {
         }
     }
     
-    // Closest point on triangle
+    // Closest point on triangle - must match distance_sq logic exactly
     __device__ float3 closest_point(float3 pos) const {
-        float3 e0 = sub3(b, a);
-        float3 e1 = sub3(c, a);
-        float3 v0 = sub3(a, pos);
+        float3 v21 = sub3(b, a);
+        float3 p1 = sub3(pos, a);
+        float3 v32 = sub3(c, b);
+        float3 p2 = sub3(pos, b);
+        float3 v13 = sub3(a, c);
+        float3 p3 = sub3(pos, c);
+        float3 nor = cross3(v21, v13);
         
-        float a00 = dot3(e0, e0);
-        float a01 = dot3(e0, e1);
-        float a11 = dot3(e1, e1);
-        float b0 = dot3(e0, v0);
-        float b1 = dot3(e1, v0);
+        float sign_test = sign_f(dot3(cross3(v21, nor), p1)) +
+                          sign_f(dot3(cross3(v32, nor), p2)) +
+                          sign_f(dot3(cross3(v13, nor), p3));
         
-        float det = a00 * a11 - a01 * a01;
-        float t0 = (a01 * b1 - a11 * b0) / fmaxf(det, 1e-10f);
-        float t1 = (a01 * b0 - a00 * b1) / fmaxf(det, 1e-10f);
-        
-        // Clamp to triangle
-        if (t0 < 0) t0 = 0;
-        if (t1 < 0) t1 = 0;
-        if (t0 + t1 > 1) {
-            float s = t0 + t1;
-            t0 /= s;
-            t1 /= s;
+        if (sign_test < 2.0f) {
+            // Outside - find closest point on edges
+            float d1 = dot3(v21, p1) / fmaxf(dot3(v21, v21), 1e-10f);
+            d1 = clamp_f(d1, 0.0f, 1.0f);
+            float3 c1_vec = sub3(mul3(v21, d1), p1);
+            float dist1 = dot3(c1_vec, c1_vec);
+            
+            float d2 = dot3(v32, p2) / fmaxf(dot3(v32, v32), 1e-10f);
+            d2 = clamp_f(d2, 0.0f, 1.0f);
+            float3 c2_vec = sub3(mul3(v32, d2), p2);
+            float dist2 = dot3(c2_vec, c2_vec);
+            
+            float d3 = dot3(v13, p3) / fmaxf(dot3(v13, v13), 1e-10f);
+            d3 = clamp_f(d3, 0.0f, 1.0f);
+            float3 c3_vec = sub3(mul3(v13, d3), p3);
+            float dist3 = dot3(c3_vec, c3_vec);
+            
+            if (dist1 <= dist2 && dist1 <= dist3) {
+                // Closest to edge a-b
+                return add3(a, mul3(v21, d1));
+            } else if (dist2 <= dist3) {
+                // Closest to edge b-c
+                return add3(b, mul3(v32, d2));
+            } else {
+                // Closest to edge c-a
+                return add3(c, mul3(v13, d3));
+            }
+        } else {
+            // Inside - project to plane
+            float nor_sq = dot3(nor, nor);
+            float d = dot3(nor, p1);
+            float3 proj = mul3(nor, d / fmaxf(nor_sq, 1e-10f));
+            return sub3(pos, proj);
         }
-        
-        return make_float3(
-            a.x + t0 * e0.x + t1 * e1.x,
-            a.y + t0 * e0.y + t1 * e1.y,
-            a.z + t0 * e0.z + t1 * e1.z
-        );
     }
     
     // Ray-triangle intersection (Möller-Trumbore)
@@ -636,7 +654,7 @@ void build_bvh_recursive(
     nodes.emplace_back();
     
     nodes[node_idx].left_idx = left_idx;
-    nodes[node_idx].right_idx = left_idx + 2;
+    nodes[node_idx].right_idx = left_idx + 2;  // +2 because we have 2 children (indices left_idx and left_idx+1)
     
     // Recursively build children
     build_bvh_recursive(tris, start, mid, nodes, left_idx, n_primitives_per_leaf);
