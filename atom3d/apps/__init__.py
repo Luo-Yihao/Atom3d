@@ -5,7 +5,8 @@ from .mesh_intersector import MeshIntersector
 from .visibility_query import VisibilityQuery
 from .udf_query import UDFQuery
 from .sdf_query import SDFQuery
-from .flood_fill import FloodFill
+
+from .sparse_flood_fill import sparse_flood_fill, get_dam_face_labels
 
 __all__ = [
     "Voxelizer",
@@ -13,5 +14,7 @@ __all__ = [
     "VisibilityQuery",
     "UDFQuery",
     "SDFQuery",
-    "FloodFill",
+
+    "sparse_flood_fill",
+    "get_dam_face_labels",
 ]

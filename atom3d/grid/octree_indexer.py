@@ -314,6 +314,62 @@ class OctreeIndexer(CubeGrid):
         
         return torch.stack([v0, v1], dim=2)  # [B, 12, 2, 3]
     
+    
+    # ============================================================
+    # Node Expansion
+    # ============================================================
+    
+    def expand_nodes(
+        self,
+        nodes: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Expand octree nodes to voxel coordinates at max_level.
+        
+        Args:
+            nodes: [N, 2] int32 - (level, node_idx) pairs where
+                   node_idx is linearized index at that level
+        
+        Returns:
+            coords: [M, 3] int32 - Voxel coords at max_level
+                    M can be > N if nodes are at coarse levels
+        
+        Example:
+            Node at level=6 represents 2^(9-6) = 8³ = 512 voxels at level=9
+        """
+        if nodes.numel() == 0:
+            return torch.empty(0, 3, dtype=self.index_dtype, device=self.device)
+        
+        all_coords = []
+        
+        for i in range(nodes.shape[0]):
+            level = nodes[i, 0].item()
+            node_idx = nodes[i, 1].item()
+            
+            # Convert node index to ijk at node level
+            res_at_level = self.get_resolution(level)
+            node_ijk = self.unravel_idx(
+                nodes[i:i+1, 1], 
+                (res_at_level, res_at_level, res_at_level)
+            )  # [1, 3]
+            
+            # How many levels to expand
+            expand_levels = self.max_level - level
+            
+            if expand_levels == 0:
+                # Already at max level
+                all_coords.append(node_ijk)
+            else:
+                # Recursively subdivide to max level
+                current_coords = node_ijk
+                for _ in range(expand_levels):
+                    current_coords = self.subdivide(current_coords, level)
+                    level += 1
+                
+                all_coords.append(current_coords)
+        
+        return torch.cat(all_coords, dim=0) if all_coords else torch.empty(0, 3, dtype=self.index_dtype, device=self.device)
+    
     # ============================================================
     # Octree Traversal
     # ============================================================
@@ -402,3 +458,112 @@ class OctreeIndexer(CubeGrid):
             current_cubes = current_cubes[result.hit]
         
         return current_cubes
+    
+    # ============================================================
+    # Flood Fill Helpers
+    # ============================================================
+    
+    def mark_active_nodes(
+        self,
+        coords: torch.Tensor
+    ) -> dict:
+        """
+        Build active nodes dictionary from max_level surface coordinates.
+        
+        Args:
+            coords: [N, 3] int32 tensor, coordinates at max_level
+        
+        Returns:
+            dict: {(level, node_idx): is_occupied}
+        """
+        device = coords.device
+        max_level = self.max_level
+        active_nodes = {}
+        
+        # ensure coords is on CPU for fast dict operations
+        coords_cpu = coords.cpu()
+        current_coords = coords_cpu.numpy() if hasattr(coords_cpu, 'numpy') else coords_cpu
+        resolution = 2 ** max_level
+        
+        # 1. Dictionary at max_level
+        current_indices = set()
+        for coord in current_coords:
+            idx = int(coord[0] * resolution * resolution + coord[1] * resolution + coord[2])
+            active_nodes[(max_level, idx)] = True
+            current_indices.add(idx)
+            
+        # 2. Aggregate upward
+        for level in range(max_level, 0, -1):
+            parent_res = 2 ** (level - 1)
+            res = 2 ** level
+            next_indices = set()
+            
+            for idx in current_indices:
+                x = idx // (res * res)
+                rem = idx % (res * res)
+                y = rem // res
+                z = rem % res
+                
+                px = x // 2
+                py = y // 2
+                pz = z // 2
+                
+                p_idx = px * parent_res * parent_res + py * parent_res + pz
+                
+                if (level - 1, p_idx) not in active_nodes:
+                    active_nodes[(level - 1, p_idx)] = False
+                    next_indices.add(p_idx)
+            
+            current_indices = next_indices
+            
+        return active_nodes
+
+    def get_node_neighbors(
+        self,
+        level: int,
+        node_idx: int,
+        connectivity: int = 6
+    ) -> list:
+        """
+        Get neighbors of a node for flood fill.
+        
+        Args:
+            level: Node level
+            node_idx: Node linear index
+            connectivity: 6 (face) or 26 (full)
+        
+        Returns:
+            List of (neighbor_level, neighbor_idx) tuples - all at SAME level
+        """
+        res = 2 ** level
+        
+        # Decode node index to coords
+        x = node_idx // (res * res)
+        rem = node_idx % (res * res)
+        y = rem // res
+        z = rem % res
+        
+        neighbors = []
+        
+        # Define offsets
+        if connectivity == 6:
+            offsets = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
+        else:
+            offsets = []
+            for dz in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    for dx in [-1, 0, 1]:
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        offsets.append((dx, dy, dz))
+        
+        # Get same-level neighbors
+        for dx, dy, dz in offsets:
+            nx, ny, nz = x + dx, y + dy, z + dz
+            
+            # Bounds check
+            if 0 <= nx < res and 0 <= ny < res and 0 <= nz < res:
+                neighbor_idx = nx * res * res + ny * res + nz
+                neighbors.append((level, neighbor_idx))
+        
+        return neighbors

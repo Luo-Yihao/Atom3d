@@ -17,40 +17,42 @@ import torch
 # Cube Topology Constants
 # ============================================================
 
-# 8 corners of a unit cube, ordered by (x, y, z) bit pattern
+# 8 corners of a unit cube, x-first ordering (graphics standard)
+# Index i has coordinate [x, y, z] = [(i>>0)&1, (i>>1)&1, (i>>2)&1] after reorder
+# This matches FlexiCubes, DISO, and traditional graphics conventions
 CUBE_CORNERS = torch.tensor(
     [
         [0, 0, 0],  # 0
-        [0, 0, 1],  # 1
+        [1, 0, 0],  # 1
         [0, 1, 0],  # 2
-        [0, 1, 1],  # 3
-        [1, 0, 0],  # 4
+        [1, 1, 0],  # 3
+        [0, 0, 1],  # 4
         [1, 0, 1],  # 5
-        [1, 1, 0],  # 6
+        [0, 1, 1],  # 6
         [1, 1, 1],  # 7
     ],
     dtype=torch.int64,
 )
 
 # 12 edges defined by corner pairs
-# First 4: z=0 face loop, next 4: z=1 face loop, last 4: vertical edges
+# Grouped by axis direction: 4 x-edges, 4 y-edges, 4 z-edges
 CUBE_EDGES = torch.tensor(
     [
-        # z=0 face loop (0-2-6-4)
-        [0, 2],
-        [2, 6],
-        [6, 4],
-        [4, 0],
-        # z=1 face loop (1-3-7-5)
-        [1, 3],
-        [3, 7],
-        [7, 5],
-        [5, 1],
-        # vertical edges along z
-        [0, 1],
-        [2, 3],
-        [6, 7],
-        [4, 5],
+        # x-direction edges (y=0,z=0), (y=1,z=0), (y=0,z=1), (y=1,z=1)
+        [0, 1],  # 0: y=0, z=0
+        [2, 3],  # 1: y=1, z=0
+        [4, 5],  # 2: y=0, z=1
+        [6, 7],  # 3: y=1, z=1
+        # y-direction edges (x=0,z=0), (x=1,z=0), (x=0,z=1), (x=1,z=1)
+        [0, 2],  # 4: x=0, z=0
+        [1, 3],  # 5: x=1, z=0
+        [4, 6],  # 6: x=0, z=1
+        [5, 7],  # 7: x=1, z=1
+        # z-direction edges (x=0,y=0), (x=1,y=0), (x=0,y=1), (x=1,y=1)
+        [0, 4],  # 8: x=0, y=0
+        [1, 5],  # 9: x=1, y=0
+        [2, 6],  # 10: x=0, y=1
+        [3, 7],  # 11: x=1, y=1
     ],
     dtype=torch.int64,
 )
@@ -58,12 +60,12 @@ CUBE_EDGES = torch.tensor(
 # 6 faces defined by 4 corners each (CCW when viewed from outside)
 CUBE_FACES = torch.tensor(
     [
-        [0, 2, 6, 4],  # -Z
-        [1, 5, 7, 3],  # +Z
-        [0, 1, 3, 2],  # -X
-        [4, 6, 7, 5],  # +X
-        [0, 4, 5, 1],  # -Y
-        [2, 3, 7, 6],  # +Y
+        [0, 4, 6, 2],  # -X face (x=0)
+        [1, 3, 7, 5],  # +X face (x=1)
+        [0, 1, 5, 4],  # -Y face (y=0)
+        [2, 6, 7, 3],  # +Y face (y=1)
+        [0, 2, 3, 1],  # -Z face (z=0)
+        [4, 5, 7, 6],  # +Z face (z=1)
     ],
     dtype=torch.int64,
 )

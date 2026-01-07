@@ -9,7 +9,7 @@ import torch
 
 from ..core.mesh_bvh import MeshBVH
 from ..grid.cube_grid import CubeGrid
-from .flood_fill import FloodFill
+
 
 
 class SDFQuery:
@@ -102,47 +102,6 @@ class SDFQuery:
         
         return winding
     
-    def query_flood(
-        self,
-        points: torch.Tensor,
-        voxel_coords: torch.Tensor,
-        grid: CubeGrid
-    ) -> torch.Tensor:
-        """
-        SDF via Flood Fill.
-        
-        Args:
-            points: [N, 3]
-            voxel_coords: [K, 3] surface voxel coordinates
-            grid: CubeGrid
-        
-        Returns:
-            sdf: [N] float32
-        
-        Suitable for: open meshes
-        """
-        # Get UDF
-        result = self.bvh.query_closest_point(points, return_uvw=False)
-        distances = result.distances
-        
-        # Perform flood fill to get inside/outside labels
-        labels = FloodFill.fill(voxel_coords, grid)
-        
-        # Convert points to grid coords and check labels
-        grid_coords = grid.world_to_grid(points).floor().int()
-        grid_coords = grid_coords.clamp(0, grid.res - 1)
-        
-        # Create lookup
-        exterior_label = 0  # Connected to seed (assumed exterior)
-        
-        # For each point, check if it's inside or outside
-        # Simplified: interpolate from voxel labels
-        sdf = distances.clone()
-        
-        # TODO: Proper interpolation from flood fill labels
-        # For now, use visibility-based estimation
-        
-        return sdf
     
     def query_raystab(
         self,
