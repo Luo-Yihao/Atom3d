@@ -15,7 +15,9 @@ _floodfill_loaded = False
 
 def get_floodfill_kernels():
     """
-    Load CUDA flood fill kernels from pytorch-floodfill-3d.
+    Load CUDA flood fill kernels via JIT compilation.
+    
+    No external dependencies - uses local kernel source.
     
     Returns:
         Compiled extension module with flood_fill function
@@ -25,35 +27,28 @@ def get_floodfill_kernels():
     if _floodfill_loaded and _floodfill_cuda is not None:
         return _floodfill_cuda
     
-    try:
-        from pytorch_floodfill_3d.cuda import floodfill_cuda
-        _floodfill_cuda = floodfill_cuda
-        _floodfill_loaded = True
-        return _floodfill_cuda
-    except ImportError:
-        # Try JIT compile from source if available
-        kernel_dir = os.path.dirname(os.path.abspath(__file__))
-        floodfill_src = os.path.join(kernel_dir, 'flood_fill_kernels.cu')
-        
-        if os.path.exists(floodfill_src):
-            from torch.utils.cpp_extension import load
-            build_dir = os.path.join(kernel_dir, 'build')
-            os.makedirs(build_dir, exist_ok=True)
-            
-            _floodfill_cuda = load(
-                name='floodfill_cuda',
-                sources=[floodfill_src],
-                build_directory=build_dir,
-                extra_cuda_cflags=['-O3', '--use_fast_math'],
-                verbose=False
-            )
-            _floodfill_loaded = True
-            return _floodfill_cuda
-        
+    kernel_dir = os.path.dirname(os.path.abspath(__file__))
+    floodfill_src = os.path.join(kernel_dir, 'flood_fill_kernels.cu')
+    
+    if not os.path.exists(floodfill_src):
         raise ImportError(
-            "pytorch-floodfill-3d not installed and no local kernel found. "
-            "Install with: pip install -e path/to/pytorch-floodfill-3d-main"
+            f"Flood fill kernel source not found at {floodfill_src}. "
+            "Please ensure Atom3D is installed correctly."
         )
+    
+    from torch.utils.cpp_extension import load
+    build_dir = os.path.join(kernel_dir, 'build')
+    os.makedirs(build_dir, exist_ok=True)
+    
+    _floodfill_cuda = load(
+        name='floodfill_cuda',
+        sources=[floodfill_src],
+        build_directory=build_dir,
+        extra_cuda_cflags=['-O3', '--use_fast_math'],
+        verbose=False
+    )
+    _floodfill_loaded = True
+    return _floodfill_cuda
 
 
 def floodfill_available() -> bool:
