@@ -102,24 +102,30 @@ struct Triangle {
         float3 v13 = sub3(a, c);
         float3 p3 = sub3(pos, c);
         float3 nor = cross3(v21, v13);
+        float nor_sq = dot3(nor, nor);
         
-        float sign_test = sign_f(dot3(cross3(v21, nor), p1)) +
-                          sign_f(dot3(cross3(v32, nor), p2)) +
-                          sign_f(dot3(cross3(v13, nor), p3));
+        bool is_degenerate = (nor_sq < 1e-20f);  // Area < 1e-10
+        float sign_test = 0.0f;
         
-        if (sign_test < 2.0f) {
+        if (!is_degenerate) {
+             sign_test = sign_f(dot3(cross3(v21, nor), p1)) +
+                         sign_f(dot3(cross3(v32, nor), p2)) +
+                         sign_f(dot3(cross3(v13, nor), p3));
+        }
+
+        if (is_degenerate || sign_test < 2.0f) {
             // Outside - distance to edges
-            float d1 = dot3(v21, p1) / fmaxf(dot3(v21, v21), 1e-10f);
+            float d1 = dot3(v21, p1) / fmaxf(dot3(v21, v21), 1e-12f);
             d1 = clamp_f(d1, 0.0f, 1.0f);
             float3 c1 = sub3(mul3(v21, d1), p1);
             float dist1 = dot3(c1, c1);
             
-            float d2 = dot3(v32, p2) / fmaxf(dot3(v32, v32), 1e-10f);
+            float d2 = dot3(v32, p2) / fmaxf(dot3(v32, v32), 1e-12f);
             d2 = clamp_f(d2, 0.0f, 1.0f);
             float3 c2 = sub3(mul3(v32, d2), p2);
             float dist2 = dot3(c2, c2);
             
-            float d3 = dot3(v13, p3) / fmaxf(dot3(v13, v13), 1e-10f);
+            float d3 = dot3(v13, p3) / fmaxf(dot3(v13, v13), 1e-12f);
             d3 = clamp_f(d3, 0.0f, 1.0f);
             float3 c3 = sub3(mul3(v13, d3), p3);
             float dist3 = dot3(c3, c3);
@@ -128,7 +134,7 @@ struct Triangle {
         } else {
             // Inside - distance to plane
             float d = dot3(nor, p1);
-            return d * d / fmaxf(dot3(nor, nor), 1e-10f);
+            return d * d / fmaxf(nor_sq, 1e-12f);
         }
     }
     
@@ -141,24 +147,30 @@ struct Triangle {
         float3 v13 = sub3(a, c);
         float3 p3 = sub3(pos, c);
         float3 nor = cross3(v21, v13);
+        float nor_sq = dot3(nor, nor);
         
-        float sign_test = sign_f(dot3(cross3(v21, nor), p1)) +
-                          sign_f(dot3(cross3(v32, nor), p2)) +
-                          sign_f(dot3(cross3(v13, nor), p3));
+        bool is_degenerate = (nor_sq < 1e-20f);
+        float sign_test = 0.0f;
         
-        if (sign_test < 2.0f) {
+        if (!is_degenerate) {
+            sign_test = sign_f(dot3(cross3(v21, nor), p1)) +
+                        sign_f(dot3(cross3(v32, nor), p2)) +
+                        sign_f(dot3(cross3(v13, nor), p3));
+        }
+        
+        if (is_degenerate || sign_test < 2.0f) {
             // Outside - find closest point on edges
-            float d1 = dot3(v21, p1) / fmaxf(dot3(v21, v21), 1e-10f);
+            float d1 = dot3(v21, p1) / fmaxf(dot3(v21, v21), 1e-12f);
             d1 = clamp_f(d1, 0.0f, 1.0f);
             float3 c1_vec = sub3(mul3(v21, d1), p1);
             float dist1 = dot3(c1_vec, c1_vec);
             
-            float d2 = dot3(v32, p2) / fmaxf(dot3(v32, v32), 1e-10f);
+            float d2 = dot3(v32, p2) / fmaxf(dot3(v32, v32), 1e-12f);
             d2 = clamp_f(d2, 0.0f, 1.0f);
             float3 c2_vec = sub3(mul3(v32, d2), p2);
             float dist2 = dot3(c2_vec, c2_vec);
             
-            float d3 = dot3(v13, p3) / fmaxf(dot3(v13, v13), 1e-10f);
+            float d3 = dot3(v13, p3) / fmaxf(dot3(v13, v13), 1e-12f);
             d3 = clamp_f(d3, 0.0f, 1.0f);
             float3 c3_vec = sub3(mul3(v13, d3), p3);
             float dist3 = dot3(c3_vec, c3_vec);
@@ -175,9 +187,8 @@ struct Triangle {
             }
         } else {
             // Inside - project to plane
-            float nor_sq = dot3(nor, nor);
             float d = dot3(nor, p1);
-            float3 proj = mul3(nor, d / fmaxf(nor_sq, 1e-10f));
+            float3 proj = mul3(nor, d / fmaxf(nor_sq, 1e-12f));
             return sub3(pos, proj);
         }
     }
