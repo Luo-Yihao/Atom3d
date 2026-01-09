@@ -56,7 +56,7 @@ class BVHAccelerator:
         self,
         vertices: torch.Tensor,
         faces: torch.Tensor,
-        n_primitives_per_leaf: int = 8
+        n_primitives_per_leaf: int = 4  # Reduced from 8 for better accuracy on dense meshes
     ):
         """
         Build BVH from mesh.

@@ -104,7 +104,7 @@ struct Triangle {
         float3 nor = cross3(v21, v13);
         float nor_sq = dot3(nor, nor);
         
-        bool is_degenerate = (nor_sq < 1e-20f);  // Area < 1e-10
+        bool is_degenerate = (nor_sq < 1e-12f);  // Increased threshold for stability
         float sign_test = 0.0f;
         
         if (!is_degenerate) {
@@ -149,7 +149,7 @@ struct Triangle {
         float3 nor = cross3(v21, v13);
         float nor_sq = dot3(nor, nor);
         
-        bool is_degenerate = (nor_sq < 1e-20f);
+        bool is_degenerate = (nor_sq < 1e-12f);  // Increased threshold for stability
         float sign_test = 0.0f;
         
         if (!is_degenerate) {
@@ -175,14 +175,22 @@ struct Triangle {
             float3 c3_vec = sub3(mul3(v13, d3), p3);
             float dist3 = dot3(c3_vec, c3_vec);
             
-            if (dist1 <= dist2 && dist1 <= dist3) {
+            // Use epsilon for stable edge selection when distances are nearly equal
+            const float eps = 1e-10f;
+            if (dist1 < dist2 - eps && dist1 < dist3 - eps) {
                 // Closest to edge a-b
                 return add3(a, mul3(v21, d1));
-            } else if (dist2 <= dist3) {
+            } else if (dist2 < dist3 - eps) {
                 // Closest to edge b-c
                 return add3(b, mul3(v32, d2));
-            } else {
+            } else if (dist3 < dist1 - eps && dist3 < dist2 - eps) {
                 // Closest to edge c-a
+                return add3(c, mul3(v13, d3));
+            } else {
+                // Multiple edges nearly equal - use minimum consistently
+                float min_dist = fminf(dist1, fminf(dist2, dist3));
+                if (dist1 == min_dist) return add3(a, mul3(v21, d1));
+                if (dist2 == min_dist) return add3(b, mul3(v32, d2));
                 return add3(c, mul3(v13, d3));
             }
         } else {
