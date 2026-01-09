@@ -21,7 +21,8 @@ def sparse_flood_fill(
     octree: OctreeIndexer,
     source: Tuple[int, int, int],
     connectivity: int = 6,
-    backend: str = 'auto'
+    backend: str = 'auto',
+    min_level: int = 0
 ) -> Dict[str, torch.Tensor]:
     """
     Sparse flood fill with optional CUDA acceleration.
@@ -54,7 +55,7 @@ def sparse_flood_fill(
     # else: python
     
     if use_cuda:
-        return _sparse_flood_fill_cuda(bvh, octree, source)
+        return _sparse_flood_fill_cuda(bvh, octree, source, min_level)
     else:
         return _sparse_flood_fill_python(bvh, octree, source, connectivity)
 
@@ -62,7 +63,8 @@ def sparse_flood_fill(
 def _sparse_flood_fill_cuda(
     bvh: MeshBVH,
     octree: OctreeIndexer,
-    source: Tuple[int, int, int]
+    source: Tuple[int, int, int],
+    min_level: int = 0
 ) -> Dict[str, torch.Tensor]:
     """CUDA-accelerated flood fill using cropped dense grid."""
     from ..kernels.flood_fill import flood_fill_3d_sparse
@@ -73,7 +75,7 @@ def _sparse_flood_fill_cuda(
     
     # Step 1: Surface voxels
     print(f"[CUDA Flood Fill] Finding surface voxels...")
-    dam_coords = octree.octree_traverse(bvh, min_level=max(4, max_level - 3))
+    dam_coords = octree.octree_traverse(bvh, min_level=min_level)
     print(f"  Dam voxels: {len(dam_coords)}")
     
     # Dam nodes
@@ -87,7 +89,10 @@ def _sparse_flood_fill_cuda(
     print(f"[CUDA Flood Fill] Running CUDA kernel on cropped region...")
     import time
     t0 = time.time()
-    water_coords, dry_coords, collision_coords, dam_boundary_mask = flood_fill_3d_sparse(dam_coords, resolution, source)
+    # Use larger padding to ensure flood fill can find exterior space
+    water_coords, dry_coords, collision_coords, dam_boundary_mask = flood_fill_3d_sparse(
+        dam_coords, resolution, source, padding=10
+    )
     cuda_time = time.time() - t0
     print(f"  CUDA flood fill took {cuda_time:.4f}s")
     
@@ -116,9 +121,9 @@ def _sparse_flood_fill_cuda(
     
     return {
         'dam_nodes': dam_nodes,
-        'dam_coords': dam_coords,                  # Raw dam coordinates (occupancy)
-        'collision_coords': collision_coords,      # Voxels at water-dam boundary (mask==0)
-        'dam_boundary_mask': dam_boundary_mask,    # Which dams are at water boundary
+        'dam_coords': dam_coords,                  # Raw dam coordinates (mesh-intersecting)
+        'collision_coords': collision_coords,      # Water voxels adjacent to dam (tide line)
+        'dam_boundary_mask': dam_boundary_mask,    # Which dams have water neighbors
         'water_nodes': water_nodes,
         'dry_nodes': dry_nodes
     }

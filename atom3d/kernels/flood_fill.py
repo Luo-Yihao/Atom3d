@@ -76,9 +76,9 @@ def flood_fill_3d(
         start_point: (z, y, x) starting coordinate
     
     Returns:
-        mask: [D, H, W] int32 tensor
+        mask: [D, H, W] int32 tensor (raw kernel output)
             -1 = unreachable (dry/interior)
-             0 = collision boundary (dam)
+             0 = dam surface (occupancy=True)
              1 = filled (water/exterior)
     """
     if not occupancy.is_cuda:
@@ -99,22 +99,30 @@ def flood_fill_3d_sparse(
     resolution: int,
     source: Tuple[int, int, int] = (0, 0, 0),
     padding: int = 2
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse flood fill using CUDA on a cropped region.
     
     Only processes the bounding box around dam_coords, then maps back to full resolution.
     
     Args:
-        dam_coords: [N, 3] int32 surface voxel coordinates
+        dam_coords: [N, 3] int32 surface voxel coordinates (mesh-intersecting)
         resolution: Full grid resolution
         source: Seed point in full resolution coords
         padding: Bounding box padding
     
     Returns:
-        water_coords: [K, 3] int32 water voxel coordinates
-        dry_coords: [M, 3] int32 dry voxel coordinates
-        dam_mask: [N] bool indicating which dam coords are at boundary
+        water_coords: [K, 3] int32 pure water voxels (exterior, NOT adjacent to dam)
+        dry_coords: [M, 3] int32 dry voxels (interior)
+        collision_coords: [C, 3] int32 collision voxels (water voxels ADJACENT to dam)
+        dam_mask: [N] bool indicating which dam coords have water neighbors
+        
+    Semantics:
+        - Dam ∩ Mesh = Dam (all dam voxels intersect mesh)
+        - Water ∩ Mesh = ∅ (water never intersects mesh)
+        - Collision ∩ Mesh = ∅ (collision never intersects mesh)
+        - Collision ⊂ "original water" (collision is the tide line)
+        - (Dam + Water + Collision + Dry) = all, mutually exclusive
     """
     device = dam_coords.device
     
@@ -152,16 +160,27 @@ def flood_fill_3d_sparse(
     mask = flood_fill_3d(occupancy)
     
     # Extract results
-    water_local = torch.nonzero(mask == 1, as_tuple=False)
+    # CUDA kernel semantics:
+    #   mask == -1: dry (interior, unreachable from source)
+    #   mask == 0: boundary (water voxels touching dam, OR dam voxels themselves)
+    #   mask == 1: water (exterior, reachable and not touching dam)
+    
+    # Collision = mask==0 AND occupancy==False (water voxels at dam boundary)
+    collision_mask_local = (mask == 0) & (~occupancy)
+    # Pure Water = mask==1 (water not touching dam)
+    pure_water_mask_local = (mask == 1)
+    # Dry = mask==-1
     dry_local = torch.nonzero(mask == -1, as_tuple=False)
-    collision_local = torch.nonzero(mask == 0, as_tuple=False)  # Boundary voxels
+    
+    water_local = torch.nonzero(pure_water_mask_local, as_tuple=False)
+    collision_local = torch.nonzero(collision_mask_local, as_tuple=False)
     
     water_global = water_local.int() + bbox_min if len(water_local) > 0 else torch.empty(0, 3, dtype=torch.int32, device=device)
     dry_global = dry_local.int() + bbox_min if len(dry_local) > 0 else torch.empty(0, 3, dtype=torch.int32, device=device)
     collision_global = collision_local.int() + bbox_min if len(collision_local) > 0 else torch.empty(0, 3, dtype=torch.int32, device=device)
     
-    # Dam boundary mask (collision = 0)
-    dam_mask = mask[local_coords[:, 0], local_coords[:, 1], local_coords[:, 2]] == 0
+    # Dam boundary mask: dam voxels that have mask==0 neighbors (i.e., touched by water)
+    dam_mask = (mask[local_coords[:, 0], local_coords[:, 1], local_coords[:, 2]] == 0)
     
     return water_global, dry_global, collision_global, dam_mask
 
