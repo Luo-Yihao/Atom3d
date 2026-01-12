@@ -14,6 +14,7 @@ from .data_structures import (
     ClosestPointResult,
     TriangleIntersectResult,
 )
+from .device_utils import resolve_device
 
 # Try to import CUDA kernels
 try:
@@ -58,7 +59,7 @@ class MeshBVH:
         self,
         vertices: torch.Tensor,
         faces: torch.Tensor,
-        device: str = 'cuda',
+        device: Optional[Union[str, torch.device]] = None,
         face_normals: Optional[torch.Tensor] = None,
         vertex_normals: Optional[torch.Tensor] = None
     ):
@@ -67,13 +68,17 @@ class MeshBVH:
         Args:
             vertices: [V, 3] mesh vertices
             faces: [F, 3] mesh face indices
-            device: 'cuda' or 'cpu'
+            device: Compute device. If None, auto-detects from input tensors.
+                    Priority: vertices.device > faces.device > 'cuda:0'
             face_normals: [F, 3] pre-computed face normals (optional, will compute if None)
             vertex_normals: [V, 3] pre-computed vertex normals (optional, will compute if None)
         """
-        self.vertices = vertices.to(device).float()
-        self.faces = faces.to(device).int()
-        self.device = device
+        # Resolve device: priority is input tensors > explicit device > default
+        resolved_device = resolve_device(vertices, faces, device=device, default='cuda')
+        
+        self.vertices = vertices.to(resolved_device).float()
+        self.faces = faces.to(resolved_device).int()
+        self.device = resolved_device
         self.num_vertices = self.vertices.shape[0]
         self.num_faces = self.faces.shape[0]
         
@@ -85,6 +90,10 @@ class MeshBVH:
         
         # Precompute face vertices for SAT clip
         self._face_verts_flat = None
+        
+        # Cache whether device is CUDA for kernel dispatch
+        self._is_cuda = (isinstance(self.device, torch.device) and self.device.type == 'cuda') or \
+                        (isinstance(self.device, str) and str(self.device).startswith('cuda'))
         
         # Precompute or store face normals (FV)
         if face_normals is not None:
@@ -104,7 +113,7 @@ class MeshBVH:
     def _build_bvh(self):
         """Build BVH acceleration structure."""
         self._bvh = None
-        if HAS_BVH and self.device == 'cuda':
+        if HAS_BVH and self._is_cuda:
             try:
                 self._bvh = BVHAccelerator(self.vertices, self.faces)
             except Exception as e:
@@ -251,7 +260,7 @@ class MeshBVH:
                 print(f"BVH AABB intersect failed: {e}")
         
         # Fallback: brute-force CUDA kernel (O(N × M))
-        if HAS_CUDA and self.device == 'cuda':
+        if HAS_CUDA and self._is_cuda:
             try:
                 hit_mask, aabb_ids, face_ids = triangle_aabb_intersect(
                     self.vertices, self.faces,
@@ -295,7 +304,7 @@ class MeshBVH:
             except Exception as e:
                 print(f"BVH broadphase failed: {e}, falling back to brute-force")
                 cand_a, cand_t = self._get_candidates_bruteforce(aabb_min, aabb_max)
-        elif HAS_CUDA and self.device == 'cuda':
+        elif HAS_CUDA and self._is_cuda:
             # Fallback: brute-force CUDA kernel
             try:
                 hit_mask, cand_a, cand_t = triangle_aabb_intersect(
@@ -319,7 +328,7 @@ class MeshBVH:
             )
         
         # Use sat_clip_polygon kernel
-        if HAS_CUDA and self.device == 'cuda':
+        if HAS_CUDA and self._is_cuda:
             try:
                 tris_verts = self._get_face_verts_flat()
                 # Mode mapping: 0/1 use mode 0 (hit only), 2 uses mode 1 (centroid), 3 uses mode 2 (polygon)
@@ -415,7 +424,7 @@ class MeshBVH:
         aabb_max: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get candidate pairs using brute-force SAT kernel."""
-        if HAS_CUDA and self.device == 'cuda':
+        if HAS_CUDA and self._is_cuda:
             try:
                 hit_mask, cand_a, cand_t = triangle_aabb_intersect(
                     self.vertices, self.faces,
@@ -524,7 +533,7 @@ class MeshBVH:
                 print(f"BVH UDF failed: {e}")
         
         # Fallback: brute-force CUDA kernel (O(N × M))
-        if HAS_CUDA and self.device == 'cuda':
+        if HAS_CUDA and self._is_cuda:
             try:
                 distances, face_ids, closest_points, uvw = point_mesh_udf(
                     self.vertices, self.faces, points.contiguous()
@@ -774,7 +783,7 @@ class MeshBVH:
                 print(f"BVH ray intersect failed: {e}")
         
         # Fallback: brute-force CUDA kernel (O(N × M))
-        if HAS_CUDA and self.device == 'cuda':
+        if HAS_CUDA and self._is_cuda:
             try:
                 from ..kernels import ray_mesh_intersect
                 hit_mask, hit_t, hit_face_ids, hit_points, hit_uvs = ray_mesh_intersect(

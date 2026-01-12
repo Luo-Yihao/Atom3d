@@ -11,6 +11,7 @@ from .data_structures import (
     VoxelPolygonMapping,
     VisibilityResult,
 )
+from .device_utils import resolve_device, ensure_same_device, get_default_cuda_device
 
 __all__ = [
     "MeshBVH",
@@ -22,4 +23,7 @@ __all__ = [
     "VoxelFaceMapping",
     "VoxelPolygonMapping",
     "VisibilityResult",
+    "resolve_device",
+    "ensure_same_device",
+    "get_default_cuda_device",
 ]

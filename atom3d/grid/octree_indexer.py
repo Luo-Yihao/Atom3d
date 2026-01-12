@@ -11,6 +11,7 @@ import torch
 if TYPE_CHECKING:
     from atom3d.core import MeshBVH
 from .cube_grid import CubeGrid
+from ..core.device_utils import resolve_device
 
 
 class OctreeIndexer(CubeGrid):
@@ -26,19 +27,21 @@ class OctreeIndexer(CubeGrid):
     Args:
         max_level: Maximum octree level (resolution = 2^max_level)
         bounds: Optional [2, 3] grid bounds (default [-1, 1])
-        device: Compute device
+        device: Compute device. If None, auto-detects from bounds tensor.
+                Priority: bounds.device > explicit device > 'cuda:0'
     """
     
     def __init__(
         self,
         max_level: int,
         bounds: Optional[torch.Tensor] = None,
-        device: str = 'cuda'
+        device: Optional[Union[str, torch.device]] = None
     ):
         self.max_level = max_level
         self._max_resolution = 2 ** max_level
         
         # Initialize parent CubeGrid at maximum resolution
+        # Device resolution is handled by CubeGrid.__init__
         super().__init__(
             resolution=self._max_resolution,
             bounds=bounds,
@@ -256,6 +259,46 @@ class OctreeIndexer(CubeGrid):
         corners_ijk = cube_ijk[:, None, :] + self.CUBE_CORNERS[None, :, :]  # [B, 8, 3]
         return corners_ijk.float() * cell_size + self.bounds[0]
     
+    def cube_to_ijk_level(
+        self,
+        cube_idx: torch.Tensor,
+        level: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Convert linear cube index to ijk coordinates at specified level.
+        
+        Args:
+            cube_idx: [B] linear indices
+            level: Octree level (default: max_level)
+        
+        Returns:
+            ijk: [B, 3] ijk coordinates
+        """
+        if level is None:
+            level = self.max_level
+        res = self.get_resolution(level)
+        return self.unravel_idx(cube_idx, (res, res, res))
+    
+    def ijk_to_cube_level(
+        self,
+        ijk: torch.Tensor,
+        level: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Convert ijk coordinates to linear cube index at specified level.
+        
+        Args:
+            ijk: [B, 3] ijk coordinates
+            level: Octree level (default: max_level)
+        
+        Returns:
+            cube_idx: [B] linear indices
+        """
+        if level is None:
+            level = self.max_level
+        res = self.get_resolution(level)
+        return self.ravel_ijk(ijk, (res, res, res))
+    
     def cube_aabb_level(
         self,
         cubes: torch.Tensor,
@@ -263,6 +306,10 @@ class OctreeIndexer(CubeGrid):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get cube AABB at specified level.
+        
+        Automatically detects input format (ijk or linear index) and handles
+        level-appropriate conversion. When level=None (default), behaves
+        identically to cube_aabb().
         
         Args:
             cubes: [B, 3] ijk coordinates OR [B] linear indices
@@ -274,11 +321,13 @@ class OctreeIndexer(CubeGrid):
         if level is None:
             level = self.max_level
         
-        # Auto-detect format
+        # Auto-detect format and convert appropriately for the level
         if cubes.dim() == 2 and cubes.shape[1] == 3:
+            # Already ijk coordinates
             cube_ijk = cubes
         elif cubes.dim() == 1:
-            cube_ijk = self.cube_to_ijk(cubes)
+            # Linear index - use level-aware conversion
+            cube_ijk = self.cube_to_ijk_level(cubes, level)
         else:
             raise ValueError(f"cubes must be [B, 3] ijk or [B] linear idx, got shape {cubes.shape}")
         

@@ -9,8 +9,10 @@ Provides complete cube vertex/edge/face relationships:
 - Coordinate conversions
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import torch
+
+from ..core.device_utils import resolve_device
 
 
 # ============================================================
@@ -125,13 +127,26 @@ class CubeGrid:
         self,
         resolution: int,
         bounds: Optional[torch.Tensor] = None,
-        device: str = "cuda",
+        device: Optional[Union[str, torch.device]] = None,
     ):
+        """
+        Initialize CubeGrid.
+        
+        Args:
+            resolution: Grid resolution (cells per axis)
+            bounds: [2, 3] tensor specifying grid bounds [[min], [max]]
+            device: Compute device. If None, auto-detects from bounds tensor.
+                    Priority: bounds.device > explicit device > 'cuda:0'
+        """
         if not isinstance(resolution, int) or resolution < 1:
             raise ValueError(f"resolution must be positive int, got {resolution}")
 
         self.res = int(resolution)
-        self.device = device
+        
+        # Resolve device: priority is bounds tensor > explicit device > default
+        resolved_device = resolve_device(bounds, device=device, default='cuda')
+        self.device = resolved_device
+        
         self.dtype = torch.float32
         self.index_dtype = torch.int64
 

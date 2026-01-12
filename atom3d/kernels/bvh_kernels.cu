@@ -15,6 +15,8 @@
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -929,6 +931,10 @@ std::vector<at::Tensor> bvh_udf_cuda(
     CHECK_INPUT(triangles);
     CHECK_INPUT(points);
     
+    // Ensure kernel runs on the correct GPU
+    c10::cuda::CUDAGuard device_guard(points.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    
     int num_points = points.size(0);
     
     auto opts_float = points.options();
@@ -942,7 +948,7 @@ std::vector<at::Tensor> bvh_udf_cuda(
     int block_size = 256;
     int grid_size = (num_points + block_size - 1) / block_size;
     
-    bvh_udf_kernel<<<grid_size, block_size>>>(
+    bvh_udf_kernel<<<grid_size, block_size, 0, stream>>>(
         reinterpret_cast<const BVHNode*>(nodes.data_ptr<float>()),
         reinterpret_cast<const Triangle*>(triangles.data_ptr<float>()),
         points.data_ptr<float>(),
@@ -968,6 +974,10 @@ std::vector<at::Tensor> bvh_ray_intersect_cuda(
     CHECK_INPUT(rays_o);
     CHECK_INPUT(rays_d);
     
+    // Ensure kernel runs on the correct GPU
+    c10::cuda::CUDAGuard device_guard(rays_o.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    
     int num_rays = rays_o.size(0);
     
     auto opts_bool = rays_o.options().dtype(torch::kBool);
@@ -982,7 +992,7 @@ std::vector<at::Tensor> bvh_ray_intersect_cuda(
     int block_size = 256;
     int grid_size = (num_rays + block_size - 1) / block_size;
     
-    bvh_ray_intersect_kernel<<<grid_size, block_size>>>(
+    bvh_ray_intersect_kernel<<<grid_size, block_size, 0, stream>>>(
         reinterpret_cast<const BVHNode*>(nodes.data_ptr<float>()),
         reinterpret_cast<const Triangle*>(triangles.data_ptr<float>()),
         rays_o.data_ptr<float>(),
@@ -1009,6 +1019,10 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     CHECK_INPUT(query_min);
     CHECK_INPUT(query_max);
     
+    // Ensure kernel runs on the correct GPU
+    c10::cuda::CUDAGuard device_guard(query_min.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    
     int num_queries = query_min.size(0);
     
     auto opts_bool = query_min.options().dtype(torch::kBool);
@@ -1024,7 +1038,7 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     int block_size = 256;
     int grid_size = (num_queries + block_size - 1) / block_size;
     
-    bvh_aabb_intersect_kernel<<<grid_size, block_size>>>(
+    bvh_aabb_intersect_kernel<<<grid_size, block_size, 0, stream>>>(
         reinterpret_cast<const BVHNode*>(nodes.data_ptr<float>()),
         reinterpret_cast<const Triangle*>(triangles.data_ptr<float>()),
         query_min.data_ptr<float>(),
