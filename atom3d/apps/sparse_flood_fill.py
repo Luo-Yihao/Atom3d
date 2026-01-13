@@ -55,7 +55,7 @@ def sparse_flood_fill(
     # else: python
     
     if use_cuda:
-        return _sparse_flood_fill_cuda(bvh, octree, source, min_level)
+        return _sparse_flood_fill_cuda(bvh, octree, source, min_level, connectivity)
     else:
         return _sparse_flood_fill_python(bvh, octree, source, connectivity)
 
@@ -64,7 +64,8 @@ def _sparse_flood_fill_cuda(
     bvh: MeshBVH,
     octree: OctreeIndexer,
     source: Tuple[int, int, int],
-    min_level: int = 0
+    min_level: int = 0,
+    connectivity: int = 26
 ) -> Dict[str, torch.Tensor]:
     """CUDA-accelerated flood fill using cropped dense grid."""
     from ..kernels.flood_fill import flood_fill_3d_sparse
@@ -73,28 +74,35 @@ def _sparse_flood_fill_cuda(
     max_level = octree.max_level
     resolution = 2 ** max_level
     
-    # Step 1: Surface voxels
-    print(f"[CUDA Flood Fill] Finding surface voxels...")
-    dam_coords = octree.octree_traverse(bvh, min_level=min_level)
-    print(f"  Dam voxels: {len(dam_coords)}")
+    # Step 1: All mesh-intersecting voxels (potential dams)
+    print(f"[CUDA Flood Fill] Finding all mesh-intersecting voxels...")
+    all_intersected_coords = octree.octree_traverse(bvh, min_level=min_level)
+    print(f"  All intersected voxels: {len(all_intersected_coords)}")
     
-    # Dam nodes
-    dam_indices = (dam_coords[:, 0] * resolution * resolution + 
-                   dam_coords[:, 1] * resolution + 
-                   dam_coords[:, 2])
-    dam_levels = torch.full((len(dam_coords),), max_level, dtype=torch.int32, device=device)
-    dam_nodes = torch.stack([dam_levels, dam_indices], dim=1)
-    
+    # Step 2: CUDA sparse flood fill
     # Step 2: CUDA sparse flood fill
     print(f"[CUDA Flood Fill] Running CUDA kernel on cropped region...")
     import time
     t0 = time.time()
     # Use larger padding to ensure flood fill can find exterior space
-    water_coords, dry_coords, collision_coords, dam_boundary_mask = flood_fill_3d_sparse(
-        dam_coords, resolution, source, padding=10
+    water_coords, dry_coords, collision_coords, true_dam_coords, dam_boundary_mask, extended_dam_coords = flood_fill_3d_sparse(
+        all_intersected_coords, resolution, source, padding=10, connectivity=connectivity
     )
     cuda_time = time.time() - t0
     print(f"  CUDA flood fill took {cuda_time:.4f}s")
+    
+    # Step 3: True Dam is already extracted from flood_fill_3d_sparse
+    # True Dam = mask==0 AND occupancy==True (flood-hit mesh-intersecting voxels)
+    print(f"  True Dam voxels (flood-hit): {len(true_dam_coords)} / {len(all_intersected_coords)}")
+    print(f"  Extended Dam voxels (diagonal fill): {len(extended_dam_coords)}")
+    
+    # Dam nodes (using true dam coords)
+    dam_coords = true_dam_coords  # Use true dam for consistency
+    dam_indices = (dam_coords[:, 0] * resolution * resolution + 
+                   dam_coords[:, 1] * resolution + 
+                   dam_coords[:, 2])
+    dam_levels = torch.full((len(dam_coords),), max_level, dtype=torch.int32, device=device)
+    dam_nodes = torch.stack([dam_levels, dam_indices], dim=1)
     
     # Convert to nodes format
     if len(water_coords) > 0:
@@ -117,15 +125,18 @@ def _sparse_flood_fill_cuda(
     
     print(f"  Water nodes: {len(water_nodes)}")
     print(f"  Dry nodes: {len(dry_nodes)}")
-    print(f"  Collision voxels (flood_mask==0): {len(collision_coords)}")
+    print(f"  Collision voxels: {len(collision_coords)}")
     
     return {
         'dam_nodes': dam_nodes,
-        'dam_coords': dam_coords,                  # Raw dam coordinates (mesh-intersecting)
+        'dam_coords': dam_coords,                  # True Dam (includes extended)
+        'extended_dam_coords': extended_dam_coords, # Just the extended ones
         'collision_coords': collision_coords,      # Water voxels adjacent to dam (tide line)
-        'dam_boundary_mask': dam_boundary_mask,    # Which dams have water neighbors
+        'dam_boundary_mask': dam_boundary_mask,    # Which intersected voxels were hit by flood
         'water_nodes': water_nodes,
-        'dry_nodes': dry_nodes
+        'water_coords': water_coords,              # Exterior water coords
+        'dry_nodes': dry_nodes,
+        'dry_coords': dry_coords                   # Interior dry coords
     }
 
 
@@ -343,8 +354,17 @@ def _sparse_flood_fill_python(
     else:
         dry_nodes_tensor = torch.empty(0, 2, dtype=torch.int32, device=device)
 
+    # Collision coords: Not computed in Python fallback
+    collision_coords = torch.empty(0, 3, dtype=torch.int32, device=device)
+    
+    # Dam Boundary Mask: Assume all found dam voxels are "true" in Python fallback (conservative)
+    dam_boundary_mask = torch.ones(len(dam_coords), dtype=torch.bool, device=device)
+
     return {
         'dam_nodes': dam_nodes_tensor,
+        'dam_coords': dam_coords,
+        'collision_coords': collision_coords,
+        'dam_boundary_mask': dam_boundary_mask,
         'water_nodes': water_nodes_tensor,
         'dry_nodes': dry_nodes_tensor
     }
