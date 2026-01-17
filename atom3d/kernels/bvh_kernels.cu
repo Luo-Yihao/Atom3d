@@ -284,9 +284,12 @@ __device__ float ray_aabb_intersect(float3 ro, float3 rd, const float* bb_min, c
     return 1e10f;
 }
 
-// Triangle-AABB SAT (omitted for brevity, unchanged)
+// Triangle-AABB SAT with epsilon tolerance for edge cases
 __device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 box_max) {
-       float3 box_center = make_float3(
+    // Small epsilon for edge-case detection (borderline intersections)
+    const float sat_eps = 1e-6f;
+    
+    float3 box_center = make_float3(
         (box_min.x + box_max.x) * 0.5f,
         (box_min.y + box_max.y) * 0.5f,
         (box_min.z + box_max.z) * 0.5f
@@ -302,27 +305,27 @@ __device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 bo
     float3 v1 = sub3(tri.b, box_center);
     float3 v2 = sub3(tri.c, box_center);
     
-    // Test box axes
+    // Test box axes with epsilon
     float min_v, max_v;
     
     min_v = fminf(fminf(v0.x, v1.x), v2.x);
     max_v = fmaxf(fmaxf(v0.x, v1.x), v2.x);
-    if (min_v > box_half.x || max_v < -box_half.x) return false;
+    if (min_v > box_half.x + sat_eps || max_v < -box_half.x - sat_eps) return false;
     
     min_v = fminf(fminf(v0.y, v1.y), v2.y);
     max_v = fmaxf(fmaxf(v0.y, v1.y), v2.y);
-    if (min_v > box_half.y || max_v < -box_half.y) return false;
+    if (min_v > box_half.y + sat_eps || max_v < -box_half.y - sat_eps) return false;
     
     min_v = fminf(fminf(v0.z, v1.z), v2.z);
     max_v = fmaxf(fmaxf(v0.z, v1.z), v2.z);
-    if (min_v > box_half.z || max_v < -box_half.z) return false;
+    if (min_v > box_half.z + sat_eps || max_v < -box_half.z - sat_eps) return false;
     
     // Triangle edges
     float3 e0 = sub3(v1, v0);
     float3 e1 = sub3(v2, v1);
     float3 e2 = sub3(v0, v2);
     
-    // Test 9 cross-product axes
+    // Test 9 cross-product axes with epsilon
     #define SAT_AXIS_TEST(edge, axis_idx) do { \
         float3 axis; \
         if (axis_idx == 0) axis = make_float3(0.0f, edge.z, -edge.y); \
@@ -333,7 +336,7 @@ __device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 bo
         float p2 = dot3(v2, axis); \
         float min_p = fminf(fminf(p0, p1), p2); \
         float max_p = fmaxf(fmaxf(p0, p1), p2); \
-        float rad = box_half.x * fabsf(axis.x) + box_half.y * fabsf(axis.y) + box_half.z * fabsf(axis.z); \
+        float rad = box_half.x * fabsf(axis.x) + box_half.y * fabsf(axis.y) + box_half.z * fabsf(axis.z) + sat_eps; \
         if (min_p > rad || max_p < -rad) return false; \
     } while(0)
     
@@ -343,10 +346,10 @@ __device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 bo
     
     #undef SAT_AXIS_TEST
     
-    // Test triangle normal
+    // Test triangle normal with epsilon
     float3 normal = cross3(e0, sub3(v2, v0));
     float d = -dot3(normal, v0);
-    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z);
+    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z) + sat_eps;
     if (fabsf(d) > r) return false;
     
     return true;
@@ -379,8 +382,8 @@ __global__ void bvh_udf_kernel(
     int best_face = -1;
     int best_tri_idx = -1;  // Direct index for O(1) barycentric lookup
     
-    // Fixed size stack - 96 for robustness on deep trees (degenerate meshes)
-    int stack[96];
+    // Fixed size stack - 128 for robustness on deep trees (degenerate meshes)
+    int stack[128];
     int stack_ptr = 0;
     
     // Push root
@@ -424,18 +427,18 @@ __global__ void bvh_udf_kernel(
             if (d1 < d2) {
                 // Left is closer
                 if (d2 < best_dist_sq) {
-                    if (stack_ptr < 96) stack[stack_ptr++] = right_child;
+                    if (stack_ptr < 128) stack[stack_ptr++] = right_child;
                 }
                 if (d1 < best_dist_sq) {
-                   if (stack_ptr < 96) stack[stack_ptr++] = left_child;
+                   if (stack_ptr < 128) stack[stack_ptr++] = left_child;
                 }
             } else {
                 // Right is closer (or equal)
                 if (d1 < best_dist_sq) {
-                   if (stack_ptr < 96) stack[stack_ptr++] = left_child;
+                   if (stack_ptr < 128) stack[stack_ptr++] = left_child;
                 }
                 if (d2 < best_dist_sq) {
-                   if (stack_ptr < 96) stack[stack_ptr++] = right_child;
+                   if (stack_ptr < 128) stack[stack_ptr++] = right_child;
                 }
             }
         }
@@ -566,7 +569,7 @@ __global__ void bvh_aabb_intersect_kernel(
     
     bool any_hit = false;
     
-    int stack[96];
+    int stack[128];
     int stack_ptr = 0;
     stack[stack_ptr++] = 0;
     
@@ -593,7 +596,7 @@ __global__ void bvh_aabb_intersect_kernel(
                 }
             }
         } else {
-            if (stack_ptr < 95) {
+            if (stack_ptr < 127) {
                 stack[stack_ptr++] = node.right_idx;
                 stack[stack_ptr++] = node.left_idx;
             }

@@ -83,26 +83,29 @@ __device__ bool triangle_aabb_sat(
     float3 tv1 = sub3(v1, box_center);
     float3 tv2 = sub3(v2, box_center);
     
-    // Quick AABB rejection test
+    // Small epsilon for edge-case detection (borderline intersections)
+    const float sat_eps = 1e-6f;
+    
+    // Quick AABB rejection test with epsilon
     float min_v, max_v;
     min_v = fminf(fminf(tv0.x, tv1.x), tv2.x);
     max_v = fmaxf(fmaxf(tv0.x, tv1.x), tv2.x);
-    if (min_v > box_half.x || max_v < -box_half.x) return false;
+    if (min_v > box_half.x + sat_eps || max_v < -box_half.x - sat_eps) return false;
     
     min_v = fminf(fminf(tv0.y, tv1.y), tv2.y);
     max_v = fmaxf(fmaxf(tv0.y, tv1.y), tv2.y);
-    if (min_v > box_half.y || max_v < -box_half.y) return false;
+    if (min_v > box_half.y + sat_eps || max_v < -box_half.y - sat_eps) return false;
     
     min_v = fminf(fminf(tv0.z, tv1.z), tv2.z);
     max_v = fmaxf(fmaxf(tv0.z, tv1.z), tv2.z);
-    if (min_v > box_half.z || max_v < -box_half.z) return false;
+    if (min_v > box_half.z + sat_eps || max_v < -box_half.z - sat_eps) return false;
     
     // Triangle edges
     float3 e0 = sub3(tv1, tv0);
     float3 e1 = sub3(tv2, tv1);
     float3 e2 = sub3(tv0, tv2);
     
-    // Test 9 axes (3 edges x 3 coordinate axes)
+    // Test 9 axes (3 edges x 3 coordinate axes) with epsilon
     #define AXIS_TEST(edge, axis) do { \
         float3 a; \
         if (axis == 0) a = make_float3(0.0f, edge.z, -edge.y); \
@@ -113,7 +116,7 @@ __device__ bool triangle_aabb_sat(
         float p2 = dot3(tv2, a); \
         float min_p = fminf(fminf(p0, p1), p2); \
         float max_p = fmaxf(fmaxf(p0, p1), p2); \
-        float rad = box_half.x * fabsf(a.x) + box_half.y * fabsf(a.y) + box_half.z * fabsf(a.z); \
+        float rad = box_half.x * fabsf(a.x) + box_half.y * fabsf(a.y) + box_half.z * fabsf(a.z) + sat_eps; \
         if (min_p > rad || max_p < -rad) return false; \
     } while(0)
     
@@ -123,10 +126,10 @@ __device__ bool triangle_aabb_sat(
     
     #undef AXIS_TEST
     
-    // Test triangle plane
+    // Test triangle plane with epsilon
     float3 normal = cross3(e0, e1);
     float d = -dot3(normal, tv0);
-    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z);
+    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z) + sat_eps;
     if (fabsf(d) > r) return false;
     
     return true;

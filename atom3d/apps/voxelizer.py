@@ -56,7 +56,7 @@ class Voxelizer:
             all_coords = self.grid.generate_all_cells()
             cube_indices = self.grid.ijk_to_cube(all_coords)
             aabb_min, aabb_max = self.grid.cube_aabb(cube_indices)
-            result = self.bvh.intersect_aabb(aabb_min, aabb_max, return_pairs=False)
+            result = self.bvh.intersect_aabb(aabb_min, aabb_max, mode=0)
             return all_coords[result.hit]
         
         else:  # 'candidate'
@@ -69,7 +69,7 @@ class Voxelizer:
             
             cube_indices = self.grid.ijk_to_cube(candidates)
             aabb_min, aabb_max = self.grid.cube_aabb(cube_indices)
-            result = self.bvh.intersect_aabb(aabb_min, aabb_max, return_pairs=False)
+            result = self.bvh.intersect_aabb(aabb_min, aabb_max, mode=0)
             return candidates[result.hit]
     
     def voxelize_with_faces(self) -> VoxelFaceMapping:
@@ -101,8 +101,8 @@ class Voxelizer:
         cube_indices = self.grid.ijk_to_cube(candidates)
         aabb_min, aabb_max = self.grid.cube_aabb(cube_indices)
         
-        # Intersect with pairs
-        result = self.bvh.intersect_aabb(aabb_min, aabb_max, return_pairs=True)
+        # Intersect with pairs (mode=1 returns aabb_ids and face_ids)
+        result = self.bvh.intersect_aabb(aabb_min, aabb_max, mode=1)
         
         # Build CSR format
         # result.aabb_ids: which candidate cell

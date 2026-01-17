@@ -15,7 +15,7 @@ _floodfill_loaded = False
 
 def get_floodfill_kernels():
     """
-    Load CUDA flood fill kernels via JIT compilation.
+    Load CUDA flood fill kernels - use cached .so if available, else JIT compile.
     
     No external dependencies - uses local kernel source.
     
@@ -28,8 +28,20 @@ def get_floodfill_kernels():
         return _floodfill_cuda
     
     kernel_dir = os.path.dirname(os.path.abspath(__file__))
-    floodfill_src = os.path.join(kernel_dir, 'flood_fill_kernels.cu')
+    build_dir = os.path.join(kernel_dir, 'build')
+    so_file = os.path.join(build_dir, 'floodfill_cuda.so')
     
+    # Fast path: if .so exists, load directly
+    if os.path.exists(so_file):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('floodfill_cuda', so_file)
+        _floodfill_cuda = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_floodfill_cuda)
+        _floodfill_loaded = True
+        return _floodfill_cuda
+    
+    # Slow path: JIT compile
+    floodfill_src = os.path.join(kernel_dir, 'flood_fill_kernels.cu')
     if not os.path.exists(floodfill_src):
         raise ImportError(
             f"Flood fill kernel source not found at {floodfill_src}. "
@@ -37,14 +49,13 @@ def get_floodfill_kernels():
         )
     
     from torch.utils.cpp_extension import load
-    build_dir = os.path.join(kernel_dir, 'build')
     os.makedirs(build_dir, exist_ok=True)
     
     _floodfill_cuda = load(
         name='floodfill_cuda',
         sources=[floodfill_src],
         build_directory=build_dir,
-        extra_cuda_cflags=['-O3', '--use_fast_math'],
+        extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_90,code=sm_90'],
         verbose=False
     )
     _floodfill_loaded = True
@@ -109,7 +120,8 @@ def flood_fill_3d_sparse(
     resolution: int,
     source: Tuple[int, int, int] = (0, 0, 0),
     padding: int = 2,
-    connectivity: int = 26
+    connectivity: int = 26,
+    return_water_dry: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse flood fill using CUDA on a cropped region.
@@ -198,15 +210,23 @@ def flood_fill_3d_sparse(
     extended_dam_local = torch.nonzero(extended_mask, as_tuple=False)
     
     # Extract results (true_dam includes the extended ones now)
+    # Extract results (true_dam includes the extended ones now)
     collision_mask_local = (mask == 1)
-    pure_water_mask_local = (mask == 2)
     true_dam_mask_local = (mask == -1)
-    dry_mask_local = (mask == -2)
     
     collision_local = torch.nonzero(collision_mask_local, as_tuple=False)
-    water_local = torch.nonzero(pure_water_mask_local, as_tuple=False)
+    
+    # Optional Water/Dry Extraction (Memory Intensive at high-res)
+    water_local = torch.empty(0, 3, dtype=torch.int32, device=device)
+    dry_local = torch.empty(0, 3, dtype=torch.int32, device=device)
+    
+    if return_water_dry:
+        pure_water_mask_local = (mask == 2)
+        dry_mask_local = (mask == -2)
+        water_local = torch.nonzero(pure_water_mask_local, as_tuple=False)
+        dry_local = torch.nonzero(dry_mask_local, as_tuple=False)
+
     true_dam_local = torch.nonzero(true_dam_mask_local, as_tuple=False)
-    dry_local = torch.nonzero(dry_mask_local, as_tuple=False)
     
     water_global = water_local.int() + bbox_min if len(water_local) > 0 else torch.empty(0, 3, dtype=torch.int32, device=device)
     dry_global = dry_local.int() + bbox_min if len(dry_local) > 0 else torch.empty(0, 3, dtype=torch.int32, device=device)

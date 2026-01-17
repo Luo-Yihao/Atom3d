@@ -14,7 +14,7 @@ _cumtv_cuda = None
 
 def get_cuda_kernels():
     """
-    Load and compile CUDA kernels using JIT compilation
+    Load CUDA kernels - use cached .so if available, else JIT compile.
     
     Returns:
         Compiled CUDA module with functions:
@@ -30,21 +30,30 @@ def get_cuda_kernels():
     
     # Get kernel source directory
     kernel_dir = os.path.dirname(os.path.abspath(__file__))
-    kernel_file = os.path.join(kernel_dir, 'cumtv_kernels.cu')
+    build_dir = os.path.join(kernel_dir, 'build')
+    so_file = os.path.join(build_dir, 'cumtv_cuda.so')
     
+    # Fast path: if .so exists with expected torch version, load directly
+    if os.path.exists(so_file):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('cumtv_cuda', so_file)
+        _cumtv_cuda = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_cumtv_cuda)
+        _kernel_loaded = True
+        return _cumtv_cuda
+    
+    # Slow path: JIT compile
+    kernel_file = os.path.join(kernel_dir, 'cumtv_kernels.cu')
     if not os.path.exists(kernel_file):
         raise RuntimeError(f"CUDA kernel file not found: {kernel_file}")
     
-    # Build directory
-    build_dir = os.path.join(kernel_dir, 'build')
     os.makedirs(build_dir, exist_ok=True)
     
-    # JIT compile
     _cumtv_cuda = load(
         name='cumtv_cuda',
         sources=[kernel_file],
         build_directory=build_dir,
-        extra_cuda_cflags=['-O3', '--use_fast_math'],
+        extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_90,code=sm_90'],
         verbose=False
     )
     

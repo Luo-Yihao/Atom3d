@@ -19,12 +19,23 @@ _BUILD_DIR = os.path.join(_KERNEL_DIR, 'build', 'bvh')
 _bvh_cuda = None
 
 def get_bvh_kernels():
-    """Get or compile the BVH CUDA kernels."""
+    """Get BVH CUDA kernels - use cached .so if available, else JIT compile."""
     global _bvh_cuda
     
     if _bvh_cuda is not None:
         return _bvh_cuda
     
+    so_file = os.path.join(_BUILD_DIR, 'bvh_cuda.so')
+    
+    # Fast path: if .so exists, load directly
+    if os.path.exists(so_file):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('bvh_cuda', so_file)
+        _bvh_cuda = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_bvh_cuda)
+        return _bvh_cuda
+    
+    # Slow path: JIT compile
     os.makedirs(_BUILD_DIR, exist_ok=True)
     
     kernel_path = os.path.join(_KERNEL_DIR, 'bvh_kernels.cu')
@@ -33,7 +44,7 @@ def get_bvh_kernels():
         name='bvh_cuda',
         sources=[kernel_path],
         build_directory=_BUILD_DIR,
-        extra_cuda_cflags=['-O3'],
+        extra_cuda_cflags=['-O3', '-gencode=arch=compute_90,code=sm_90'],
         verbose=False
     )
     
