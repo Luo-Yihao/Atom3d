@@ -313,6 +313,15 @@ class CubeGrid:
         return coords.view(*orig_shape, 3)
 
     def voxel_unique_vertices(self, voxels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns the unique vertices of the given voxels.
+        Args:
+            voxels: [N,3] or [N] tensor of voxel indices
+        Returns:
+            unique_vertices: [M,3] tensor of unique vertex indices
+            unique_coords: [M,3] tensor of unique vertex coordinates
+            voxel_to_vertex: [N,8] tensor of voxel to vertex mapping
+        """
         if voxels.dim() == 2 and voxels.shape[1] == 3:
             cube_idx = self.ijk_to_cube(voxels)
         elif voxels.dim() == 1:

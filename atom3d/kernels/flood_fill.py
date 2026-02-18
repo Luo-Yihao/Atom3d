@@ -189,21 +189,37 @@ def flood_fill_3d_sparse(
     mask = flood_fill_3d(occupancy, start_point=start_point_tuple, connectivity=connectivity)
     
     # --- Extend Dam Logic ---
-    # User request: Dry (-2) voxels that are 26-adjacent to flooded voxels (>0) should be considered Dam (-1)
-    # This captures diagonal leaks or disconnected components that are touching water diagonally
+    # Dry (-2) voxels that are adjacent (based on connectivity) to flooded voxels (>0) 
+    # should be considered Dam (-1). This captures disconnected surface components.
     
     # 1. Identify flooded region (Water or Collision)
-    flooded = (mask > 0).float() # [D, H, W]
+    flooded = (mask > 0).float()  # [D, H, W]
     
-    # 2. Dilate flooded region by 1 voxel (26-connectivity) using max_pool3d
-    # input needs to be [N, C, D, H, W]
+    # 2. Dilate flooded region based on connectivity
     flooded_expanded = flooded.unsqueeze(0).unsqueeze(0)
-    dilated_flooded = torch.nn.functional.max_pool3d(
-        flooded_expanded, kernel_size=3, stride=1, padding=1
-    ).squeeze(0).squeeze(0)
+    
+    if connectivity == 6:
+        # 6-connectivity: only face neighbors (cross-shaped kernel)
+        # Use 3x3x3 with only center cross active
+        kernel = torch.zeros(1, 1, 3, 3, 3, device=device)
+        kernel[0, 0, 1, 1, 1] = 1  # center
+        kernel[0, 0, 0, 1, 1] = 1  # -z
+        kernel[0, 0, 2, 1, 1] = 1  # +z
+        kernel[0, 0, 1, 0, 1] = 1  # -y
+        kernel[0, 0, 1, 2, 1] = 1  # +y
+        kernel[0, 0, 1, 1, 0] = 1  # -x
+        kernel[0, 0, 1, 1, 2] = 1  # +x
+        dilated_flooded = torch.nn.functional.conv3d(
+            flooded_expanded, kernel, padding=1
+        ).squeeze(0).squeeze(0) > 0.5
+    else:
+        # 26-connectivity: full 3x3x3 cube
+        dilated_flooded = torch.nn.functional.max_pool3d(
+            flooded_expanded, kernel_size=3, stride=1, padding=1
+        ).squeeze(0).squeeze(0) > 0.5
     
     # 3. Identify candidates: Dry (-2) AND Occupied AND Adjacent to Flooded
-    extended_mask = (mask == -2) & occupancy & (dilated_flooded > 0.5)
+    extended_mask = (mask == -2) & occupancy & dilated_flooded
     
     # 4. Update Mask and Extract Coordinates
     mask[extended_mask] = -1

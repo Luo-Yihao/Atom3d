@@ -14,7 +14,7 @@ from .visibility_query import (
 )
 from .udf_query import UDFQuery
 from .sdf_query import SDFQuery
-from .sparse_flood_fill import sparse_flood_fill, get_dam_face_labels
+from .sparse_flood_fill import sparse_flood_fill, get_dam_wet_faces
 
 __all__ = [
     # Query Applications
@@ -33,5 +33,5 @@ __all__ = [
     
     # Flood Fill
     "sparse_flood_fill",
-    "get_dam_face_labels",
+    "get_dam_wet_faces",
 ]
