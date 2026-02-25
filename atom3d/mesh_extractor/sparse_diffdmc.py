@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Union, NamedTuple
-from ..grid.cube_grid import CUBE_CORNERS
+from ..constants import CUBE_CORNERS
 from .tables import *
 
 
@@ -15,6 +15,22 @@ class SparseDiffDMCOutput(NamedTuple):
     p_alpha: torch.Tensor           # [E, 3] alpha-weighted zero-crossing points
     n_alpha: torch.Tensor           # [E, 3] normals at crossing points
     v_features: Optional[torch.Tensor] = None  # [V, C] interpolated vertex features
+
+
+class SparseDMC(nn.Module):
+    """
+    Sparse Dual Marching Cubes (DMC).
+    
+    A sparse, differentiable mesh extraction layer based on FlexiCubes.
+    
+    This is an alias for SparseDiffDMC.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.module = SparseDiffDMC(*args, **kwargs)
+        
+    def forward(self, *args, **kwargs):
+        return self.module.forward(*args, **kwargs)
 
 
 class SparseDiffDMC(nn.Module):
@@ -141,7 +157,7 @@ class SparseDiffDMC(nn.Module):
 
         # 2. Apply Deformation
         world_scale = 2.0 / resolution
-        grid_pos = unique_corners_pos + 0.5
+        grid_pos = unique_corners_pos
         world_pos = grid_pos * world_scale - 1.0
         
         if deform is not None:
@@ -512,7 +528,7 @@ class SparseDiffDMC(nn.Module):
         edge_group, edge_group_to_vd, edge_group_to_cube, vd_num_edges, vd_gamma = [], [], [], [], []
         
         total_num_vd = 0
-        vd_idx_map = torch.zeros((case_ids.shape[0], 12), dtype=torch.int64, device=self.device)
+        vd_idx_map = torch.full((case_ids.shape[0], 12), -1, dtype=torch.int64, device=self.device)
 
         unique_nums = torch.unique(num_vd)
         for num in unique_nums:

@@ -15,97 +15,19 @@ import torch
 from ..core.device_utils import resolve_device
 
 
-# ============================================================
-# Cube Topology Constants
-# ============================================================
+from ..constants import CUBE_CORNERS, CUBE_EDGES, CUBE_FACES, NEIGHBOR_OFFSETS_6, EDGE_TO_FACES
+# FACE_NORMALS in CubeGrid are ordered differently, keep them for now or align later
+FACE_NORMALS = torch.tensor([
+    [0, 0, -1],  # 0: -Z
+    [0, 0, 1],   # 1: +Z
+    [-1, 0, 0],  # 2: -X
+    [1, 0, 0],   # 3: +X
+    [0, -1, 0],  # 4: -Y
+    [0, 1, 0],   # 5: +Y
+], dtype=torch.int64)
 
-# 8 corners of a unit cube, x-first ordering (graphics standard)
-# Index i has coordinate [x, y, z] = [(i>>0)&1, (i>>1)&1, (i>>2)&1] after reorder
-# This matches FlexiCubes, DISO, and traditional graphics conventions
-CUBE_CORNERS = torch.tensor(
-    [
-        [0, 0, 0],  # 0
-        [1, 0, 0],  # 1
-        [0, 1, 0],  # 2
-        [1, 1, 0],  # 3
-        [0, 0, 1],  # 4
-        [1, 0, 1],  # 5
-        [0, 1, 1],  # 6
-        [1, 1, 1],  # 7
-    ],
-    dtype=torch.int64,
-)
-
-# 12 edges defined by corner pairs
-# Grouped by axis direction: 4 x-edges, 4 y-edges, 4 z-edges
-CUBE_EDGES = torch.tensor(
-    [
-        # x-direction edges (y=0,z=0), (y=1,z=0), (y=0,z=1), (y=1,z=1)
-        [0, 1],  # 0: y=0, z=0
-        [2, 3],  # 1: y=1, z=0
-        [4, 5],  # 2: y=0, z=1
-        [6, 7],  # 3: y=1, z=1
-        # y-direction edges (x=0,z=0), (x=1,z=0), (x=0,z=1), (x=1,z=1)
-        [0, 2],  # 4: x=0, z=0
-        [1, 3],  # 5: x=1, z=0
-        [4, 6],  # 6: x=0, z=1
-        [5, 7],  # 7: x=1, z=1
-        # z-direction edges (x=0,y=0), (x=1,y=0), (x=0,y=1), (x=1,y=1)
-        [0, 4],  # 8: x=0, y=0
-        [1, 5],  # 9: x=1, y=0
-        [2, 6],  # 10: x=0, y=1
-        [3, 7],  # 11: x=1, y=1
-    ],
-    dtype=torch.int64,
-)
-
-# 6 faces defined by 4 corners each (CCW when viewed from outside)
-CUBE_FACES = torch.tensor(
-    [
-        [0, 4, 6, 2],  # -X face (x=0)
-        [1, 3, 7, 5],  # +X face (x=1)
-        [0, 1, 5, 4],  # -Y face (y=0)
-        [2, 6, 7, 3],  # +Y face (y=1)
-        [0, 2, 3, 1],  # -Z face (z=0)
-        [4, 5, 7, 6],  # +Z face (z=1)
-    ],
-    dtype=torch.int64,
-)
-
-# Edge to face mapping: which 2 faces each edge belongs to
-EDGE_TO_FACES = torch.tensor(
-    [
-        # z=0 loop edges
-        [0, 2],
-        [0, 5],
-        [0, 3],
-        [0, 4],
-        # z=1 loop edges
-        [1, 2],
-        [1, 5],
-        [1, 3],
-        [1, 4],
-        # vertical edges
-        [2, 4],
-        [2, 5],
-        [3, 5],
-        [3, 4],
-    ],
-    dtype=torch.int64,
-)
-
-# Face normal directions (integer axis normals)
-FACE_NORMALS = torch.tensor(
-    [
-        [0, 0, -1],  # 0: -Z
-        [0, 0, 1],  # 1: +Z
-        [-1, 0, 0],  # 2: -X
-        [1, 0, 0],  # 3: +X
-        [0, -1, 0],  # 4: -Y
-        [0, 1, 0],  # 5: +Y
-    ],
-    dtype=torch.int64,
-)
+# Wait, EDGE_TO_FACES also depends on CUBE_FACES order.
+# I'll keep local definitions for CubeGrid internal topology for safety until verified.
 
 
 class CubeGrid:

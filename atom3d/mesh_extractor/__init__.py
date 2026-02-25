@@ -5,6 +5,6 @@ Provides differentiable mesh extraction algorithms:
 - SparseDiffDMC: Sparse Differentiable Dual Marching Cubes
 """
 
-from .sparse_diffdmc import SparseDiffDMC
+from .sparse_diffdmc import SparseDiffDMC, SparseDMC
 
-__all__ = ["SparseDiffDMC"]
+__all__ = ["SparseDiffDMC", "SparseDMC"]
