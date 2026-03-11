@@ -89,10 +89,11 @@ class SparseDiffDMC(nn.Module):
         weight_scale: float = 0.99,
         inference_mode: str = "auto",
         dtype: Optional[torch.dtype] = None,
+        corner_gradients: Optional[torch.Tensor] = None,
     ) -> SparseDiffDMCOutput:
         """
         Extract mesh from sparse voxel SDF.
-        
+
         Args:
             voxel_coords: [N, 3] integer coordinates of active cubes
             sdf: [M] SDF values at unique grid corners
@@ -106,11 +107,14 @@ class SparseDiffDMC(nn.Module):
             isovalue: Isosurface value (default 0)
             qef_reg_scale: Regularization scale for QEF
             weight_scale: Scale for weight normalization
-            inference_mode: 
+            inference_mode:
                 - "auto": train→weighted_avg, eval→qef
                 - "weighted_avg": force FlexiCubes style
                 - "qef": force QEF solver
             dtype: Optional dtype for precision control
+            corner_gradients: [M, 3] pre-computed SDF gradients at grid corners.
+                If provided, skips internal finite-difference estimation.
+                For BVH-based SDF: normalize(p - closest_point(p)) is exact.
             
         Returns:
             SparseDiffDMCOutput NamedTuple with fields:
@@ -195,9 +199,20 @@ class SparseDiffDMC(nn.Module):
         )
 
         # 8. Compute Dual Vertices
+        # In QEF mode we need per-corner SDF gradients for accurate surface normals.
+        # Prefer caller-supplied exact gradients (e.g. normalize(p - bvh.closest(p)))
+        # over the internal finite-difference estimation, which is less accurate.
+        if mode == "qef":
+            if corner_gradients is None:
+                corner_gradients = self._estimate_corner_gradients(
+                    voxelgrid_vertices, scalar_field, cube_idx, dtype
+                )
+            else:
+                corner_gradients = corner_gradients.to(dtype)
         vd, L_dev, vd_gamma, vd_idx_map, vd_features, p_alpha, n_alpha = self._compute_vd(
             voxelgrid_vertices, cube_idx[surf_cubes], surf_edges, scalar_field,
-            case_ids, beta_s, alpha_s, gamma_s, idx_map, qef_reg_scale, v_features, dtype, mode
+            case_ids, beta_s, alpha_s, gamma_s, idx_map, qef_reg_scale, v_features, dtype, mode,
+            corner_gradients=corner_gradients,
         )
 
         # 9. Triangulate
@@ -401,6 +416,71 @@ class SparseDiffDMC(nn.Module):
         return normals_per_vd[edge_group_to_vd]
 
     @torch.no_grad()
+    def _estimate_corner_gradients(self, voxelgrid_vertices, scalar_field, cube_idx, dtype):
+        """
+        Estimate the full 3D gradient at every grid corner using all incident edges.
+
+        On a deformed grid, the edge-direction proxy (used in
+        _compute_normals_from_gradient) is inaccurate: each edge only captures the
+        1D projection of the gradient along its direction. Here we collect ALL edges
+        incident to each corner and solve the over-determined system
+
+            edge_dir_j · g_i  ≈  (s_j - s_i) / |p_j - p_i|   for each neighbor j
+
+        by least squares (D^T D) g = D^T b via scatter_add, giving a proper 3D
+        gradient even after arbitrary deformation.
+        """
+        device = self.device
+        M = voxelgrid_vertices.shape[0]
+
+        # All unique edges from all active cubes
+        all_edges = cube_idx[:, self.cube_edges.long()].reshape(-1, 2).long()
+        unique_edges = torch.unique(all_edges, dim=0)          # [E, 2]
+        i0, i1 = unique_edges[:, 0], unique_edges[:, 1]
+
+        p0 = voxelgrid_vertices[i0]
+        p1 = voxelgrid_vertices[i1]
+        s0 = scalar_field[i0].to(dtype)
+        s1 = scalar_field[i1].to(dtype)
+
+        edge_vec = p1 - p0
+        edge_len = edge_vec.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        edge_dir = edge_vec / edge_len                          # [E, 3]
+        grad_proj = (s1 - s0) / edge_len.squeeze(-1)           # [E]  (Δs / |Δp|)
+
+        # Build D^T D and D^T b for each corner via scatter_add.
+        # Each undirected edge (i0, i1) contributes to both endpoints:
+        #   corner i0:  direction = +edge_dir,  projection = +grad_proj
+        #   corner i1:  direction = -edge_dir,  projection = -grad_proj
+        # The outer product d⊗d is the same in both directions, so we accumulate
+        # it symmetrically; only the rhs vector flips sign.
+        outer   = edge_dir.unsqueeze(2) * edge_dir.unsqueeze(1)  # [E, 3, 3]
+        Dtb_fwd = grad_proj.unsqueeze(-1) * edge_dir             # [E, 3]
+
+        DtD = torch.zeros(M, 3, 3, device=device, dtype=dtype)
+        Dtb = torch.zeros(M, 3, device=device, dtype=dtype)
+
+        DtD.scatter_add_(0, i0.view(-1, 1, 1).expand(-1, 3, 3), outer)
+        DtD.scatter_add_(0, i1.view(-1, 1, 1).expand(-1, 3, 3), outer)
+        Dtb.scatter_add_(0, i0.view(-1, 1).expand(-1, 3),  Dtb_fwd)
+        Dtb.scatter_add_(0, i1.view(-1, 1).expand(-1, 3), -Dtb_fwd)
+
+        # Regularise (isolated corners get identity → zero gradient fallback)
+        I3 = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+        DtD = DtD + 1e-4 * I3
+
+        try:
+            gradients = torch.linalg.solve(DtD, Dtb.unsqueeze(-1)).squeeze(-1)  # [M, 3]
+        except RuntimeError:
+            gradients = torch.bmm(torch.linalg.pinv(DtD), Dtb.unsqueeze(-1)).squeeze(-1)
+
+        nan_mask = torch.isnan(gradients).any(dim=-1)
+        if nan_mask.any():
+            gradients[nan_mask] = 0.0
+
+        return gradients  # [M, 3], points in direction of increasing SDF (outward)
+
+    @torch.no_grad()
     def _identify_surf_cubes(self, scalar_field, cube_idx):
         occ_n = scalar_field < 0
         occ_fx8 = occ_n[cube_idx.reshape(-1)].reshape(-1, 8)
@@ -501,17 +581,60 @@ class SparseDiffDMC(nn.Module):
         return surf_edges, idx_map, counts, surf_edges_mask
 
     def _compute_vd(self, voxelgrid_vertices, surf_cubes_fx8, surf_edges, scalar_field,
-                    case_ids, beta, alpha, gamma_f, idx_map, qef_reg_scale, v_features, dtype, mode):
+                    case_ids, beta, alpha, gamma_f, idx_map, qef_reg_scale, v_features, dtype, mode,
+                    corner_gradients=None):
         """Compute dual vertices with optional QEF or weighted average."""
-        
+
         # 1. Zero crossings
         surf_edges_x = voxelgrid_vertices[surf_edges.reshape(-1)].reshape(-1, 2, 3)
         surf_edges_s = scalar_field[surf_edges.reshape(-1)].reshape(-1, 2, 1)
-        
+
         zero_crossing = self._linear_interp(surf_edges_s, surf_edges_x)
-        
-        # Compute normals (simple edge-based method - will be improved in QEF mode)
-        all_normals = self._compute_normals_from_gradient(scalar_field, surf_edges, voxelgrid_vertices)
+
+        # Compute per-crossing normals.
+        # QEF mode: interpolate 3D corner gradients to each crossing point.
+        #   This correctly handles deformed grids — the full gradient is estimated
+        #   from ALL edges at each corner (not just the one surface edge direction).
+        # Weighted-avg mode: fall back to the fast edge-direction approximation.
+        if corner_gradients is not None:
+            s0_e = scalar_field[surf_edges[:, 0]].to(dtype)
+            s1_e = scalar_field[surf_edges[:, 1]].to(dtype)
+            t = (s0_e / (s0_e - s1_e + 1e-8)).clamp(0, 1).unsqueeze(-1)  # [E, 1]
+            g0 = corner_gradients[surf_edges[:, 0].long()]  # [E, 3]
+            g1 = corner_gradients[surf_edges[:, 1].long()]  # [E, 3]
+
+            # Confidence-weighted interpolation.
+            # Corners with few incident edges have near-zero gradient magnitude
+            # (regularisation collapses DtD → 0 solution).  Multiplying by the
+            # gradient norm gives confidence: a weak corner contributes little,
+            # so the crossing normal comes mostly from the well-constrained endpoint.
+            #
+            #   w0 = |g0| * (1-t)   — position × confidence for corner 0
+            #   w1 = |g1| *   t     — position × confidence for corner 1
+            #   g_cross = (w0*g0 + w1*g1) / (w0 + w1)
+            #
+            # Reduces to plain linear interp when both norms are equal; gives full
+            # weight to the valid endpoint when the other has near-zero gradient.
+            norm0 = g0.norm(dim=-1, keepdim=True)          # [E, 1]
+            norm1 = g1.norm(dim=-1, keepdim=True)          # [E, 1]
+            w0 = norm0 * (1 - t)                           # [E, 1]
+            w1 = norm1 * t                                 # [E, 1]
+            denom = w0 + w1                                # [E, 1]
+
+            # Where denom is too small both corners lack gradient info → fall back
+            # to the simple edge-direction approximation for those crossings only.
+            has_grad = (denom > 1e-6).squeeze(-1)          # [E]
+            g_cross = (w0 * g0 + w1 * g1) / denom.clamp(min=1e-8)
+
+            if not has_grad.all():
+                edge_fallback = self._compute_normals_from_gradient(
+                    scalar_field, surf_edges, voxelgrid_vertices
+                )
+                g_cross = torch.where(has_grad.unsqueeze(-1), g_cross, edge_fallback)
+
+            all_normals = F.normalize(g_cross, dim=-1)
+        else:
+            all_normals = self._compute_normals_from_gradient(scalar_field, surf_edges, voxelgrid_vertices)
         
         # Features
         if v_features is not None:
@@ -581,13 +704,29 @@ class SparseDiffDMC(nn.Module):
         
         # Compute dual vertices based on mode
         if mode == "qef":
-            # In QEF mode, compute better normals using scatter-gather then solve QEF
-            # First compute normals per dual vertex from edge gradient projections
-            n_per_vd = self._compute_normals_scatter(x_group, s_group, edge_group_to_vd, total_num_vd)
-            # Get per-edge normals from per-vertex normals (for output)
-            n_group = n_per_vd  # Already expanded in _compute_normals_scatter
-            # Solve QEF with scatter-gather pattern (fully parallel)
-            vd = self._solve_qef_scatter(ue_group, n_group, edge_group_to_vd, total_num_vd, qef_reg_scale)
+            # Use per-edge normals directly (NOT averaged per-VD normals).
+            # Sharp feature preservation requires distinct normals per crossing point:
+            #   - smooth face: all normals in a VD are parallel → QEF is underdetermined
+            #     → regularization pulls vertex to centroid (correct)
+            #   - sharp edge/corner: crossings have distinct X/Y/Z normals → constraint
+            #     planes intersect at the feature point → QEF solves to the sharp vertex
+            # Averaging normals per VD (old _compute_normals_scatter approach) collapses
+            # all constraints to the same direction, destroying sharp feature information.
+            #
+            # Also use zero_crossing_group (true linear interpolation) instead of
+            # alpha-weighted ue_group — alpha is a training-time flexibility parameter
+            # and shifts crossing positions away from the true zero crossing.
+            vd = self._solve_qef_scatter(zero_crossing_group, n_group, edge_group_to_vd, total_num_vd, qef_reg_scale)
+            # Cell-bounds clamping (mirrors mc-dc's BOUNDARY/CLIP logic):
+            # QEF solutions on sharp features can fall outside the owning cell,
+            # causing self-intersections. Clamp to each cube's world-space AABB.
+            cell_verts = voxelgrid_vertices[surf_cubes_fx8.long()]   # [N_surf, 8, 3]
+            cell_min = cell_verts.min(dim=1).values                  # [N_surf, 3]
+            cell_max = cell_verts.max(dim=1).values                  # [N_surf, 3]
+            # Map each dual vertex to its owning cube (last scatter wins — any cube is valid)
+            vd_to_cube = torch.zeros(total_num_vd, dtype=torch.long, device=self.device)
+            vd_to_cube.scatter_(0, edge_group_to_vd, edge_group_to_cube.long())
+            vd = torch.max(torch.min(vd, cell_max[vd_to_cube]), cell_min[vd_to_cube])
         else:
             # Weighted average (original FlexiCubes approach)
             vd = torch.zeros((total_num_vd, 3), device=self.device, dtype=dtype)

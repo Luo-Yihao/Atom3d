@@ -593,9 +593,10 @@ class MeshBVH:
         """
         # Need full result for sign computation
         result = self._udf_query(points) if not return_grad else self._udf_with_grad(points)
-        
-        # Compute sign using closest face normal
-        signs = self._compute_sign(points, result.closest_points, result.face_ids)
+
+        # Compute sign using pseudo-normal (vertex normals interpolated via uvw)
+        signs = self._compute_sign(points, result.closest_points, result.face_ids,
+                                   uvw=result.uvw)
         result.distances = result.distances * signs
         
         # If no extras requested, return tensor directly
@@ -616,26 +617,47 @@ class MeshBVH:
         self,
         points: torch.Tensor,
         closest_points: torch.Tensor,
-        face_ids: torch.Tensor
+        face_ids: torch.Tensor,
+        uvw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute SDF sign based on cached face normals."""
+        """Compute SDF sign using angle-weighted pseudo-normal.
+
+        When vertex normals are available (and uvw barycentric coords are
+        provided), interpolates per-vertex normals at the closest point.
+        This is robust at mesh edges and corners where a single face normal
+        is ambiguous.  Falls back to face normal if vertex normals are absent.
+        """
+        import torch.nn.functional as F
         device = points.device
         N = points.shape[0]
-        
-        # Get cached face normals
+
         valid = face_ids >= 0
         signs = torch.ones(N, device=device)
-        
-        if valid.any():
-            # Use cached face normals instead of recomputing
-            normals = self._face_normals[face_ids[valid]]
-            
-            # Sign = dot(point - closest, normal)
-            to_point = points[valid] - closest_points[valid]
-            dot = (to_point * normals).sum(dim=1)
-            signs[valid] = torch.sign(dot)
-            signs[valid][signs[valid] == 0] = 1
-        
+
+        if not valid.any():
+            return signs
+
+        fi  = face_ids[valid].long()
+        pts = points[valid]
+        clo = closest_points[valid]
+
+        if self._vertex_normals is not None and uvw is not None:
+            # Pseudo-normal: interpolate vertex normals with barycentric coords
+            u = uvw[valid, 0:1]
+            v = uvw[valid, 1:2]
+            w = uvw[valid, 2:3]
+            n = (u * self._vertex_normals[self.faces[fi, 0]] +
+                 v * self._vertex_normals[self.faces[fi, 1]] +
+                 w * self._vertex_normals[self.faces[fi, 2]])
+            n = F.normalize(n, dim=-1)
+        else:
+            n = self._face_normals[fi]
+
+        dot = ((pts - clo) * n).sum(dim=-1)
+        s = torch.sign(dot)
+        s[s == 0] = 1.0
+        signs[valid] = s
+
         return signs
     
     def _compute_barycentric(

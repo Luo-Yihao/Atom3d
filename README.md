@@ -30,6 +30,11 @@ Atom3D provides high-performance primitives for modern 3D deep learning:
 ```bash
 pip install -e . --no-build-isolation
 ```
+or
+
+```bash
+pip install git+https://github.com/Luo-Yihao/atom3d.git --no-build-isolation
+```
 
 **Requirements:** Python ≥ 3.8, PyTorch ≥ 2.0, CUDA ≥ 11.0
 
