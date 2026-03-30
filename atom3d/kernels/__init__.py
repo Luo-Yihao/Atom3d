@@ -33,8 +33,15 @@ def get_cuda_kernels():
     build_dir = os.path.join(kernel_dir, 'build')
     so_file = os.path.join(build_dir, 'cumtv_cuda.so')
     
-    # Fast path: if .so exists with expected torch version, load directly
-    if os.path.exists(so_file):
+    # Fast path: if .so exists and matches current torch + CUDA, load directly
+    tag_file = os.path.join(build_dir, '.build_tag')
+    torch_tag = f"{torch.__version__}_{torch.version.cuda}_{torch.cuda.get_arch_list()}"
+    tag_ok = False
+    if os.path.exists(tag_file):
+        with open(tag_file) as f:
+            tag_ok = f.read().strip() == torch_tag
+
+    if os.path.exists(so_file) and tag_ok:
         import importlib.util
         spec = importlib.util.spec_from_file_location('cumtv_cuda', so_file)
         _cumtv_cuda = importlib.util.module_from_spec(spec)
@@ -53,10 +60,14 @@ def get_cuda_kernels():
         name='cumtv_cuda',
         sources=[kernel_file],
         build_directory=build_dir,
-        extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_90,code=sm_90'],
+        extra_cuda_cflags=['-O3', '--use_fast_math'],
         verbose=False
     )
     
+    # Write build tag so cached .so is invalidated on env change
+    with open(tag_file, 'w') as f:
+        f.write(torch_tag)
+
     _kernel_loaded = True
     return _cumtv_cuda
 

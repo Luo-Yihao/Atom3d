@@ -227,9 +227,12 @@ class MeshBVH:
                 - poly_counts: [num_hits] int (if mode == 3)
         """
         N = aabb_min.shape[0]
-        
-        # All modes now use clip-based test for accuracy
-        # Mode 0/1 will use clip internally but only return hit/pairs
+
+        # Mode 0/1: use SAT (no degenerate filtering — avoids false negatives
+        # that would permanently lose surface during octree broadphase)
+        # Mode 2/3: use clip-based test for centroid/area/polygon output
+        if mode <= 1:
+            return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=(mode >= 1))
         return self._intersect_aabb_clip(aabb_min, aabb_max, mode)
     
     def _intersect_aabb_sat(

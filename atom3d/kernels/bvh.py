@@ -44,7 +44,7 @@ def get_bvh_kernels():
         name='bvh_cuda',
         sources=[kernel_path],
         build_directory=_BUILD_DIR,
-        extra_cuda_cflags=['-O3', '-gencode=arch=compute_90,code=sm_90'],
+        extra_cuda_cflags=['-O3', '--use_fast_math'],
         verbose=False
     )
     
