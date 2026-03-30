@@ -53,25 +53,25 @@ class SparseDiffDMC(nn.Module):
         self.dtype = dtype
         
         # Load tables
-        self.register_buffer('dmc_table', torch.tensor(dmc_table, dtype=torch.int32, device=device))
-        self.register_buffer('num_vd_table', torch.tensor(num_vd_table, dtype=torch.int32, device=device))
-        self.register_buffer('check_table', torch.tensor(check_table, dtype=torch.int32, device=device))
-        self.register_buffer('tet_table', torch.tensor(tet_table, dtype=torch.int32, device=device))
-        
-        self.register_buffer('quad_split_1', torch.tensor([0, 1, 2, 0, 2, 3], dtype=torch.int32, device=device))
-        self.register_buffer('quad_split_2', torch.tensor([0, 1, 3, 3, 1, 2], dtype=torch.int32, device=device))
-        self.register_buffer('quad_split_train', torch.tensor([0, 1, 1, 2, 2, 3, 3, 0], dtype=torch.int32, device=device))
+        self.register_buffer('dmc_table', torch.tensor(dmc_table, dtype=torch.long, device=device))
+        self.register_buffer('num_vd_table', torch.tensor(num_vd_table, dtype=torch.long, device=device))
+        self.register_buffer('check_table', torch.tensor(check_table, dtype=torch.long, device=device))
+        self.register_buffer('tet_table', torch.tensor(tet_table, dtype=torch.long, device=device))
+
+        self.register_buffer('quad_split_1', torch.tensor([0, 1, 2, 0, 2, 3], dtype=torch.long, device=device))
+        self.register_buffer('quad_split_2', torch.tensor([0, 1, 3, 3, 1, 2], dtype=torch.long, device=device))
+        self.register_buffer('quad_split_train', torch.tensor([0, 1, 1, 2, 2, 3, 3, 0], dtype=torch.long, device=device))
 
         self.register_buffer('cube_corners', CUBE_CORNERS.to(device).float())
-        self.register_buffer('cube_corners_idx', torch.pow(2, torch.arange(8, dtype=torch.int32, device=device)))
+        self.register_buffer('cube_corners_idx', torch.pow(2, torch.arange(8, dtype=torch.long, device=device)))
         
         self.register_buffer('cube_edges', torch.tensor([
             0, 1, 1, 5, 4, 5, 0, 4, 
             2, 3, 3, 7, 6, 7, 2, 6,
             2, 0, 3, 1, 7, 5, 6, 4
-        ], dtype=torch.int32, device=device))
-        
-        self.adj_pairs = torch.tensor([0, 1, 1, 3, 3, 2, 2, 0], dtype=torch.int32, device=device)
+        ], dtype=torch.long, device=device))
+
+        self.adj_pairs = torch.tensor([0, 1, 1, 3, 3, 2, 2, 0], dtype=torch.long, device=device)
 
     def forward(
         self,
@@ -85,7 +85,7 @@ class SparseDiffDMC(nn.Module):
         gamma: Optional[torch.Tensor] = None,
         v_features: Optional[torch.Tensor] = None,
         isovalue: float = 0.0,
-        qef_reg_scale: float = 1e-3,
+        qef_reg_scale: float = 1e-2,
         weight_scale: float = 0.99,
         inference_mode: str = "auto",
         dtype: Optional[torch.dtype] = None,
@@ -218,7 +218,8 @@ class SparseDiffDMC(nn.Module):
         # 9. Triangulate
         vertices, faces, vd_features = self._triangulate(
             scalar_field, surf_edges, vd, vd_gamma, edge_counts, idx_map,
-            vd_idx_map, surf_edges_mask, self.training, vd_features, dtype
+            vd_idx_map, surf_edges_mask, self.training, vd_features, dtype,
+            corner_gradients=corner_gradients if mode == "qef" else None,
         )
 
         return SparseDiffDMCOutput(
@@ -285,75 +286,106 @@ class SparseDiffDMC(nn.Module):
         
         return F.normalize(normals, dim=-1)
 
-    def _solve_qef_scatter(self, crossing_points, normals, edge_group_to_vd, num_vd, qef_reg_scale):
+    def _solve_qef_scatter(self, crossing_points, normals, edge_group_to_vd, num_vd, qef_reg_scale,
+                           vd_cell_center=None, vd_cell_min=None, vd_cell_max=None):
         """
-        FC-style parallel QEF solver using scatter-gather pattern.
-        
-        Solves for each dual vertex i:
-            min_x  Σ (n_j · (x - p_j))²  +  λ * ||x - centroid_i||²
-        
-        Using normal equations: (A^T A + λI) x = A^T b + λ centroid
-        Where A = stacked normals, b = n · p for each point
-        
-        Key insight: A^T A = Σ (n ⊗ n), A^T b = Σ (n · p) n
-        These sums can be done with scatter_add, then batch solve.
+        QEF solver: Tikhonov regularization toward cell center + mass-point fallback.
+
+        Standard "Dual Contouring: The Secret Sauce" approach (Schaefer & Warren):
+          1. Solve min_x Σ (n_j · (x - p_j))² + λ ||x - cell_center||²
+          2. If solution falls outside cell bounds, fall back to mass point (centroid).
+
+        Tikhonov regularization handles rank-deficient cases (coplanar normals)
+        by pulling toward cell center. Mass-point fallback catches remaining outliers.
+
+        Uses lstsq on [A; √λ I] δ = [b; √λ (cell_center - centroid)]
+        in centroid-relative coordinates for numerical stability.
         """
         device = crossing_points.device
         dtype = crossing_points.dtype
         K = crossing_points.shape[0]
-        
+
         if num_vd == 0 or K == 0:
             return torch.zeros((max(num_vd, 1), 3), device=device, dtype=dtype)[:num_vd]
-        
-        # Use index_add instead of torch_scatter for compatibility
+
         edge_group_to_vd = edge_group_to_vd.long()
-        
-        # Compute constraint scalars: c_i = n_i · p_i
-        c = (normals * crossing_points).sum(dim=-1)  # [K]
-        
-        # Build outer product terms: n ⊗ n  [K, 3, 3]
-        outer = normals.unsqueeze(2) * normals.unsqueeze(1)  # [K, 3, 3]
-        
-        # Build A^T A per group using scatter
-        # AtA[g] = Σ_{i: group[i]=g} outer[i]
-        AtA = torch.zeros(num_vd, 3, 3, device=device, dtype=dtype)
-        AtA.scatter_add_(0, edge_group_to_vd.view(-1, 1, 1).expand(-1, 3, 3), outer)
-        
-        # Build A^T b per group: Σ c_i * n_i
-        Atb_terms = c.view(-1, 1) * normals  # [K, 3]
-        Atb = torch.zeros(num_vd, 3, device=device, dtype=dtype)
-        Atb.scatter_add_(0, edge_group_to_vd.view(-1, 1).expand(-1, 3), Atb_terms)
-        
-        # Compute centroid per group
+
+        # Mass point (centroid of crossing points per VD)
         centroid = torch.zeros(num_vd, 3, device=device, dtype=dtype)
         centroid.scatter_add_(0, edge_group_to_vd.view(-1, 1).expand(-1, 3), crossing_points)
         counts = torch.zeros(num_vd, device=device, dtype=dtype)
         counts.scatter_add_(0, edge_group_to_vd, torch.ones(K, device=device, dtype=dtype))
-        counts = counts.clamp_min(1)  # Avoid divide by zero
+        counts = counts.clamp_min(1)
         centroid = centroid / counts.view(-1, 1)
-        
-        # Add regularization: λ * ||x - centroid||²
-        # This adds λI to AtA and λ*centroid to Atb
-        I3 = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)  # [1, 3, 3]
-        AtA = AtA + qef_reg_scale * I3
-        Atb = Atb + qef_reg_scale * centroid
-        
-        # Add small epsilon to diagonal for numerical stability
-        eps = 1e-8
-        AtA = AtA + eps * I3
-        
-        # Batch solve: [G, 3, 3] @ [G, 3, 1] = [G, 3, 1]
-        try:
-            vd = torch.linalg.solve(AtA, Atb.unsqueeze(-1)).squeeze(-1)  # [G, 3]
-        except RuntimeError:
-            # Fallback to pseudo-inverse for singular matrices
-            vd = torch.bmm(torch.linalg.pinv(AtA), Atb.unsqueeze(-1)).squeeze(-1)
-        
-        # Check for NaN and replace with centroid
+
+        # Regularization target: cell center if available, else centroid
+        reg_target = vd_cell_center if vd_cell_center is not None else centroid
+
+        # Shift to local coordinates (centroid-relative)
+        local_pts = crossing_points - centroid[edge_group_to_vd]  # [K, 3]
+
+        # Constraint: n_j · (x - q_j) = 0  →  n_j · δ = n_j · q_j
+        rhs = (normals * local_pts).sum(dim=-1)  # [K]
+
+        MAX_EDGES = 7
+        ROWS = MAX_EDGES + 3  # 7 constraints + 3 regularization
+
+        A = torch.zeros(num_vd, ROWS, 3, device=device, dtype=dtype)
+        b = torch.zeros(num_vd, ROWS, 1, device=device, dtype=dtype)
+
+        # Scatter constraints into per-VD fixed-size slots
+        _, sort_idx = torch.sort(edge_group_to_vd, stable=True)
+        sorted_vd = edge_group_to_vd[sort_idx]
+        group_start = torch.zeros(K, dtype=torch.long, device=device)
+        group_start[1:] = (sorted_vd[1:] != sorted_vd[:-1]).long()
+        group_start = group_start.cumsum(0)
+        group_offsets = torch.zeros(num_vd, dtype=torch.long, device=device)
+        group_offsets.scatter_(0, sorted_vd, torch.arange(K, device=device))
+        local_idx = torch.arange(K, device=device) - group_offsets[sorted_vd]
+        local_idx = local_idx.clamp(max=MAX_EDGES - 1)
+        inv_sort = torch.empty_like(sort_idx)
+        inv_sort[sort_idx] = torch.arange(K, device=device)
+        slot = local_idx[inv_sort]
+
+        # Fill A and b
+        A[edge_group_to_vd, slot] = normals
+        b[edge_group_to_vd, slot, 0] = rhs
+
+        # Tikhonov regularization: √λ I δ = √λ (reg_target - centroid)
+        # In world coords this pulls toward reg_target (cell center).
+        sqrt_lambda = qef_reg_scale ** 0.5
+        reg_rhs = (reg_target - centroid) * sqrt_lambda  # [G, 3]
+        A[:, MAX_EDGES + 0, 0] = sqrt_lambda
+        A[:, MAX_EDGES + 1, 1] = sqrt_lambda
+        A[:, MAX_EDGES + 2, 2] = sqrt_lambda
+        b[:, MAX_EDGES + 0, 0] = reg_rhs[:, 0]
+        b[:, MAX_EDGES + 1, 0] = reg_rhs[:, 1]
+        b[:, MAX_EDGES + 2, 0] = reg_rhs[:, 2]
+
+        # Batch lstsq
+        result = torch.linalg.lstsq(A, b)
+        delta = result.solution.squeeze(-1)  # [G, 3]
+
+        # World coordinates
+        vd = delta + centroid
+
+        # NaN fallback → mass point
         nan_mask = torch.isnan(vd).any(dim=-1)
         if nan_mask.any():
             vd[nan_mask] = centroid[nan_mask]
-        
+
+        # Mass-point fallback: if QEF solution is far outside cell bounds, use centroid.
+        # Allow 1 cell of slack for sharp features, but catch extreme outliers.
+        if vd_cell_min is not None and vd_cell_max is not None:
+            cell_size = (vd_cell_max - vd_cell_min)  # [G, 3]
+            margin = cell_size  # allow 1 full cell outside
+            outside = (
+                (vd < vd_cell_min - margin).any(dim=-1) |
+                (vd > vd_cell_max + margin).any(dim=-1)
+            )
+            if outside.any():
+                vd[outside] = centroid[outside]
+
         return vd
 
     def _compute_normals_scatter(self, surf_edges_x, surf_edges_s, edge_group_to_vd, num_vd):
@@ -490,9 +522,9 @@ class SparseDiffDMC(nn.Module):
 
     @torch.no_grad()
     def _get_case_id_sparse(self, occ_fx8, surf_cubes, res, voxel_coords):
-        occ_int = occ_fx8[surf_cubes].to(torch.int32)
+        occ_int = occ_fx8[surf_cubes].long()
         corners_idx = self.cube_corners_idx.unsqueeze(0)
-        case_ids = (occ_int * corners_idx).sum(-1, dtype=torch.int32)
+        case_ids = (occ_int * corners_idx).sum(-1)
         
         problem_config = self.check_table[case_ids]
         to_check = problem_config[..., 0] == 1
@@ -555,8 +587,8 @@ class SparseDiffDMC(nn.Module):
         to_invert = found_mask & (problem_config_adj[..., 0] == 1)
         
         if to_invert.any():
-            idx = torch.arange(case_ids.shape[0], dtype=torch.int32, device=self.device)[to_check][within_range][to_invert]
-            case_ids.index_put_((idx,), problem_config[to_invert][..., -1].int())
+            idx = torch.arange(case_ids.shape[0], device=self.device)[to_check][within_range][to_invert]
+            case_ids.index_put_((idx,), problem_config[to_invert][..., -1])
              
         return case_ids
 
@@ -566,18 +598,18 @@ class SparseDiffDMC(nn.Module):
         all_edges = cube_idx[surf_cubes][:, self.cube_edges.long()].reshape(-1, 2)
         unique_edges, _idx_map, counts = torch.unique(all_edges, dim=0, return_inverse=True, return_counts=True)
         unique_edges = unique_edges.long()
-        
+
         mask_edges = occ_n[unique_edges.reshape(-1)].reshape(-1, 2).sum(-1) == 1
-        
+
         surf_edges_mask = mask_edges[_idx_map]
         counts = counts[_idx_map]
-        
-        mapping = torch.full((unique_edges.shape[0],), -1, dtype=torch.int32, device=self.device)
-        mapping[mask_edges] = torch.arange(mask_edges.sum(), dtype=torch.int32, device=self.device)
-        
+
+        mapping = torch.ones((unique_edges.shape[0]), dtype=torch.long, device=self.device) * -1
+        mapping[mask_edges] = torch.arange(mask_edges.sum(), device=self.device)
+
         idx_map = mapping[_idx_map]
         surf_edges = unique_edges[mask_edges]
-        
+
         return surf_edges, idx_map, counts, surf_edges_mask
 
     def _compute_vd(self, voxelgrid_vertices, surf_cubes_fx8, surf_edges, scalar_field,
@@ -651,7 +683,7 @@ class SparseDiffDMC(nn.Module):
         edge_group, edge_group_to_vd, edge_group_to_cube, vd_num_edges, vd_gamma = [], [], [], [], []
         
         total_num_vd = 0
-        vd_idx_map = torch.full((case_ids.shape[0], 12), -1, dtype=torch.int64, device=self.device)
+        vd_idx_map = torch.zeros((case_ids.shape[0], 12), dtype=torch.long, device=self.device)
 
         unique_nums = torch.unique(num_vd)
         for num in unique_nums:
@@ -716,17 +748,23 @@ class SparseDiffDMC(nn.Module):
             # Also use zero_crossing_group (true linear interpolation) instead of
             # alpha-weighted ue_group — alpha is a training-time flexibility parameter
             # and shifts crossing positions away from the true zero crossing.
-            vd = self._solve_qef_scatter(zero_crossing_group, n_group, edge_group_to_vd, total_num_vd, qef_reg_scale)
-            # Cell-bounds clamping (mirrors mc-dc's BOUNDARY/CLIP logic):
-            # QEF solutions on sharp features can fall outside the owning cell,
-            # causing self-intersections. Clamp to each cube's world-space AABB.
-            cell_verts = voxelgrid_vertices[surf_cubes_fx8.long()]   # [N_surf, 8, 3]
-            cell_min = cell_verts.min(dim=1).values                  # [N_surf, 3]
-            cell_max = cell_verts.max(dim=1).values                  # [N_surf, 3]
-            # Map each dual vertex to its owning cube (last scatter wins — any cube is valid)
+            # Compute cell geometry for each dual vertex.
+            cell_verts = voxelgrid_vertices[surf_cubes_fx8.long()]  # [N_surf, 8, 3]
+            cell_centers = cell_verts.mean(dim=1)       # [N_surf, 3]
+            cell_mins = cell_verts.min(dim=1).values     # [N_surf, 3]
+            cell_maxs = cell_verts.max(dim=1).values     # [N_surf, 3]
+            # Map each VD to its owning cube
             vd_to_cube = torch.zeros(total_num_vd, dtype=torch.long, device=self.device)
             vd_to_cube.scatter_(0, edge_group_to_vd, edge_group_to_cube.long())
-            vd = torch.max(torch.min(vd, cell_max[vd_to_cube]), cell_min[vd_to_cube])
+            vd_cell_center = cell_centers[vd_to_cube]
+            vd_cell_min = cell_mins[vd_to_cube]
+            vd_cell_max = cell_maxs[vd_to_cube]
+
+            vd = self._solve_qef_scatter(
+                zero_crossing_group, n_group, edge_group_to_vd, total_num_vd,
+                qef_reg_scale, vd_cell_center=vd_cell_center,
+                vd_cell_min=vd_cell_min, vd_cell_max=vd_cell_max,
+            )
         else:
             # Weighted average (original FlexiCubes approach)
             vd = torch.zeros((total_num_vd, 3), device=self.device, dtype=dtype)
@@ -755,57 +793,88 @@ class SparseDiffDMC(nn.Module):
         
         return vd, L_dev, vd_gamma, vd_idx_map, vd_features, ue_group, n_group
 
-    def _triangulate(self, scalar_field, surf_edges, vd, vd_gamma, edge_counts, idx_map, 
-                     vd_idx_map, surf_edges_mask, training, vd_features, dtype):
-        
+    def _triangulate(self, scalar_field, surf_edges, vd, vd_gamma, edge_counts, idx_map,
+                     vd_idx_map, surf_edges_mask, training, vd_features, dtype,
+                     corner_gradients=None):
+        """Aligned with official FlexiCubes _triangulate (no .int() casts, in-place flip)."""
         with torch.no_grad():
             group_mask = (edge_counts == 4) & surf_edges_mask
             group = idx_map.reshape(-1)[group_mask]
             vd_idx = vd_idx_map.reshape(-1)[group_mask]
-            
             edge_indices, indices = torch.sort(group, stable=True)
-            indices = indices.int()
-            quad_vd_idx = vd_idx[indices].reshape(-1, 4).int()
-            
+            quad_vd_idx = vd_idx[indices].reshape(-1, 4)
+
+            # Consistent winding (same as official)
             s_edges = scalar_field[surf_edges[edge_indices.reshape(-1, 4)[:, 0]].reshape(-1)].reshape(-1, 2)
             flip_mask = s_edges[:, 0] > 0
-            
-            quad_vd_idx = torch.cat((
-                quad_vd_idx[flip_mask][:, [0, 1, 3, 2]],
-                quad_vd_idx[~flip_mask][:, [2, 3, 1, 0]]
-            ))
+            quad_vd_idx[flip_mask] = quad_vd_idx[flip_mask][:, [0, 1, 3, 2]]
+            quad_vd_idx[~flip_mask] = quad_vd_idx[~flip_mask][:, [2, 3, 1, 0]]
 
-        quad_gamma = vd_gamma[quad_vd_idx.long()].reshape(-1, 4)
-        gamma_02 = quad_gamma[:, 0] * quad_gamma[:, 2]
-        gamma_13 = quad_gamma[:, 1] * quad_gamma[:, 3]
-        
+        # Gamma for quad split decision (aligned with official FlexiCubes)
+        quad_gamma = torch.index_select(input=vd_gamma, index=quad_vd_idx.reshape(-1), dim=0).reshape(-1, 4)
+        gamma_02 = quad_gamma[:, 0:1] * quad_gamma[:, 2:3]  # [N, 1]
+        gamma_13 = quad_gamma[:, 1:2] * quad_gamma[:, 3:4]  # [N, 1]
+
         if not training:
-            mask = (gamma_02 > gamma_13)
-            faces = torch.zeros((quad_gamma.shape[0], 6), dtype=torch.int64, device=self.device)
-            faces[mask] = quad_vd_idx[mask][:, self.quad_split_1.long()].long()
-            faces[~mask] = quad_vd_idx[~mask][:, self.quad_split_2.long()].long()
+            mask = (gamma_02 > gamma_13).squeeze(1)
+            faces = torch.zeros((quad_gamma.shape[0], 6), dtype=torch.long, device=self.device)
+            faces[mask] = quad_vd_idx[mask][:, self.quad_split_1]
+            faces[~mask] = quad_vd_idx[~mask][:, self.quad_split_2]
             faces = faces.reshape(-1, 3)
         else:
-            vd_quad = vd[quad_vd_idx.long()].reshape(-1, 4, 3)
-            vd_02 = (vd_quad[:, 0] + vd_quad[:, 2]) / 2
-            vd_13 = (vd_quad[:, 1] + vd_quad[:, 3]) / 2
+            vd_quad = torch.index_select(input=vd, index=quad_vd_idx.reshape(-1), dim=0).reshape(-1, 4, 3)
+            vd_02 = (vd_quad[:, 0:1] + vd_quad[:, 2:3]) / 2
+            vd_13 = (vd_quad[:, 1:2] + vd_quad[:, 3:4]) / 2
             weight_sum = (gamma_02 + gamma_13) + 1e-8
-            vd_center = (vd_02 * gamma_02.unsqueeze(-1) + vd_13 * gamma_13.unsqueeze(-1)) / weight_sum.unsqueeze(-1)
-            
+            vd_center = ((vd_02 * gamma_02.unsqueeze(-1) + vd_13 * gamma_13.unsqueeze(-1)) /
+                         weight_sum.unsqueeze(-1)).squeeze(1)
+
             if vd_features is not None:
-                feat_quad = vd_features[quad_vd_idx.long()].reshape(-1, 4, vd_features.shape[-1])
-                feat_02 = (feat_quad[:, 0] + feat_quad[:, 2]) / 2
-                feat_13 = (feat_quad[:, 1] + feat_quad[:, 3]) / 2
-                feat_center = (feat_02 * gamma_02.unsqueeze(-1) + feat_13 * gamma_13.unsqueeze(-1)) / weight_sum.unsqueeze(-1)
+                feat_quad = vd_features[quad_vd_idx.reshape(-1)].reshape(-1, 4, vd_features.shape[-1])
+                feat_02 = (feat_quad[:, 0:1] + feat_quad[:, 2:3]) / 2
+                feat_13 = (feat_quad[:, 1:2] + feat_quad[:, 3:4]) / 2
+                feat_center = ((feat_02 * gamma_02.unsqueeze(-1) + feat_13 * gamma_13.unsqueeze(-1)) /
+                               weight_sum.unsqueeze(-1)).squeeze(1)
                 vd_features = torch.cat([vd_features, feat_center])
-            
+
             vd_center_idx = torch.arange(vd_center.shape[0], device=self.device) + vd.shape[0]
             vd = torch.cat([vd, vd_center])
-            
-            faces = quad_vd_idx[:, self.quad_split_train.long()].reshape(-1, 4, 2)
+
+            faces = quad_vd_idx[:, self.quad_split_train].reshape(-1, 4, 2)
             faces = torch.cat([faces, vd_center_idx.reshape(-1, 1, 1).repeat(1, 4, 1)], -1).reshape(-1, 3)
 
         return vd, faces, vd_features
+
+    def _estimate_vd_normals(self, vd, corner_gradients, surf_edges, edge_counts,
+                              idx_map, vd_idx_map, surf_edges_mask, scalar_field):
+        """Estimate per-dual-vertex normals by interpolating corner gradients at crossing points."""
+        num_vd = vd.shape[0]
+        device = vd.device
+        dtype = vd.dtype
+
+        # Interpolate corner gradients to each surface edge crossing
+        s0 = scalar_field[surf_edges[:, 0]].to(dtype)
+        s1 = scalar_field[surf_edges[:, 1]].to(dtype)
+        t = (s0 / (s0 - s1 + 1e-8)).clamp(0, 1).unsqueeze(-1)  # [E, 1]
+        g0 = corner_gradients[surf_edges[:, 0].long()]
+        g1 = corner_gradients[surf_edges[:, 1].long()]
+        edge_normals = F.normalize((1 - t) * g0 + t * g1, dim=-1)  # [E, 3]
+
+        # Map edges to dual vertices via the same group structure used in _compute_vd
+        # Reuse vd_idx_map: for each (cube, edge) → dual vertex index
+        group_mask = (edge_counts == 4) & surf_edges_mask
+        group = idx_map.reshape(-1)[group_mask]
+        vd_idx = vd_idx_map.reshape(-1)[group_mask]
+
+        # Average normals per dual vertex
+        vd_normals = torch.zeros(num_vd, 3, device=device, dtype=dtype)
+        vd_counts = torch.zeros(num_vd, 1, device=device, dtype=dtype)
+        edge_n = edge_normals[group.long()]
+        vd_normals.scatter_add_(0, vd_idx.long().unsqueeze(1).expand(-1, 3), edge_n)
+        vd_counts.scatter_add_(0, vd_idx.long().unsqueeze(1), torch.ones(vd_idx.shape[0], 1, device=device, dtype=dtype))
+        vd_normals = vd_normals / vd_counts.clamp(min=1)
+
+        return vd_normals
 
     def _linear_interp(self, edges_weight, edges_x):
         """Linear interpolation for zero-crossing computation."""

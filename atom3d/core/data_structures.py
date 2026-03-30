@@ -47,6 +47,7 @@ class ClosestPointResult:
     face_ids: torch.Tensor      # [N] int32 closest face
     closest_points: torch.Tensor  # [N, 3]
     uvw: Optional[torch.Tensor] = None  # [N, 3] barycentric coordinates
+    pseudo_normals: Optional[torch.Tensor] = None  # [N, 3] normal of closest face
 
 
 @dataclass
