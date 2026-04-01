@@ -55,7 +55,7 @@ def get_floodfill_kernels():
         name='floodfill_cuda',
         sources=[floodfill_src],
         build_directory=build_dir,
-        extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_90,code=sm_90'],
+        extra_cuda_cflags=['-O3', '--use_fast_math'],
         verbose=False
     )
     _floodfill_loaded = True

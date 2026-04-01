@@ -522,74 +522,60 @@ class SparseDiffDMC(nn.Module):
 
     @torch.no_grad()
     def _get_case_id_sparse(self, occ_fx8, surf_cubes, res, voxel_coords):
+        """
+        Resolve DMC topology ambiguity (C16/C19 configurations).
+
+        For each problematic surface cube, checks whether its neighbor (given
+        by the check_table direction offset) is also problematic.  If so, the
+        cube's case_id is replaced with the inverted variant to ensure
+        consistent topology across the shared face.
+
+        Neighbor lookup uses a sorted hash table built only over the
+        problematic subset, since non-problematic neighbors never trigger
+        inversion.  This keeps the sort O(P log P) with P << N_surf.
+        """
+        device = self.device
+        res_long = int(res)
+
         occ_int = occ_fx8[surf_cubes].long()
-        corners_idx = self.cube_corners_idx.unsqueeze(0)
-        case_ids = (occ_int * corners_idx).sum(-1)
-        
-        problem_config = self.check_table[case_ids]
-        to_check = problem_config[..., 0] == 1
-        
+        case_ids = (occ_int * self.cube_corners_idx.unsqueeze(0)).sum(-1)
+
+        prob_cfg = self.check_table[case_ids]
+        to_check = prob_cfg[..., 0] == 1
+
         if not to_check.any():
             return case_ids
-        
-        problem_config = problem_config[to_check]
-        problem_config_index = voxel_coords[surf_cubes][to_check]
-        
-        vol_idx_problem = problem_config_index
-        vol_idx_problem_adj = vol_idx_problem + problem_config[..., 1:4]
-        
-        limit = res
-        within_range = (
-            (vol_idx_problem_adj >= 0).all(dim=-1) & 
-            (vol_idx_problem_adj < limit).all(dim=-1)
-        )
-        
+
+        prob_coords = voxel_coords[surf_cubes][to_check].long()  # [P, 3]
+        prob_cfg_sub = prob_cfg[to_check]                         # [P, 5]
+
+        # Neighbor coordinates from the direction offset in the check table.
+        adj_coords = prob_coords + prob_cfg_sub[:, 1:4]           # [P, 3]
+        within_range = (adj_coords >= 0).all(dim=-1) & (adj_coords < res_long).all(dim=-1)
+
         if not within_range.any():
             return case_ids
-        
-        vol_idx_problem = vol_idx_problem[within_range]
-        vol_idx_problem_adj = vol_idx_problem_adj[within_range]
-        problem_config = problem_config[within_range]
-        problem_config_index = problem_config_index[within_range]
-        
-        res_long = int(res)
-        def hash_coords(coords):
-            return coords[:, 0] * res_long * res_long + coords[:, 1] * res_long + coords[:, 2]
-        
-        # GPU-native hash lookup using searchsorted (replaces Python dict)
-        keys_source = hash_coords(problem_config_index.long())
-        keys_target = hash_coords(vol_idx_problem_adj.long())
-        
-        # Sort source keys for binary search
-        sorted_keys, sort_order = keys_source.sort()
-        
-        # Find positions in sorted array
-        pos = torch.searchsorted(sorted_keys, keys_target)
-        pos = pos.clamp(max=len(sorted_keys) - 1)
-        
-        # Check if found (key must match)
-        found = sorted_keys[pos] == keys_target
-        
-        # Map back to original indices (-1 for not found)
-        indices = torch.where(found, sort_order[pos], torch.tensor(-1, dtype=torch.long, device=self.device))
-        
-        found_mask = (indices != -1)
-        
-        if not found_mask.any():
+
+        # Hash table over all problematic cubes for neighbor lookup.
+        # Only problematic cubes can trigger inversion, so the search
+        # domain need not include the full surface-cube set.
+        prob_hash = prob_coords[:, 0] * (res_long * res_long) + prob_coords[:, 1] * res_long + prob_coords[:, 2]
+        sorted_hash, sort_order = prob_hash.sort()
+
+        adj_hash = (adj_coords[within_range, 0] * (res_long * res_long)
+                   + adj_coords[within_range, 1] * res_long
+                   + adj_coords[within_range, 2])
+
+        pos = torch.searchsorted(sorted_hash, adj_hash).clamp(max=sorted_hash.shape[0] - 1)
+        found = sorted_hash[pos] == adj_hash
+
+        if not found.any():
             return case_ids
-        
-        problem_config_padded = torch.cat([problem_config, torch.zeros((1, 5), dtype=problem_config.dtype, device=problem_config.device)])
-        indices_safe = indices.clone()
-        indices_safe[~found_mask] = len(problem_config)
-        
-        problem_config_adj = problem_config_padded[indices_safe]
-        
-        to_invert = found_mask & (problem_config_adj[..., 0] == 1)
-        
-        if to_invert.any():
-            idx = torch.arange(case_ids.shape[0], device=self.device)[to_check][within_range][to_invert]
-            case_ids.index_put_((idx,), problem_config[to_invert][..., -1])
-             
+
+        # Invert case_ids for cubes whose neighbor is confirmed problematic.
+        idx = torch.arange(case_ids.shape[0], device=device)[to_check][within_range][found]
+        case_ids.index_put_((idx,), prob_cfg_sub[within_range][found][:, -1])
+
         return case_ids
 
     @torch.no_grad()

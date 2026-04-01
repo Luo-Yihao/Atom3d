@@ -444,24 +444,55 @@ class MeshBVH:
         aabb_max: torch.Tensor,
         return_pairs: bool
     ) -> AABBIntersectResult:
-        """PyTorch AABB-AABB overlap (broadphase only)."""
+        """PyTorch AABB-AABB overlap (broadphase only), chunked to avoid OOM."""
         N = aabb_min.shape[0]
+        F = self.faces.shape[0]
         device = aabb_min.device
-        
+
         face_aabb_min, face_aabb_max = self.get_face_aabb()
-        
-        aabb_min_exp = aabb_min.unsqueeze(1)
-        aabb_max_exp = aabb_max.unsqueeze(1)
-        face_min_exp = face_aabb_min.unsqueeze(0)
-        face_max_exp = face_aabb_max.unsqueeze(0)
-        
-        overlap = (aabb_min_exp <= face_max_exp) & (aabb_max_exp >= face_min_exp)
-        overlap_all = overlap.all(dim=2)
-        
-        hit = overlap_all.any(dim=1)
-        
+
+        # Estimate memory: N × F × 3 bools × 1 byte each
+        mem_bytes = N * F * 3
+        # Target ~2GB per chunk
+        max_chunk = max(1, int(2e9 / (F * 3))) if mem_bytes > 2e9 else N
+
+        if max_chunk >= N:
+            # Small enough — single pass (original path)
+            overlap = (aabb_min.unsqueeze(1) <= face_aabb_max.unsqueeze(0)) & \
+                      (aabb_max.unsqueeze(1) >= face_aabb_min.unsqueeze(0))
+            overlap_all = overlap.all(dim=2)
+            hit = overlap_all.any(dim=1)
+            if return_pairs:
+                aabb_ids, face_ids = torch.where(overlap_all)
+                return AABBIntersectResult(hit=hit, aabb_ids=aabb_ids, face_ids=face_ids)
+            else:
+                return AABBIntersectResult(hit=hit)
+
+        # Chunked path
+        hit = torch.zeros(N, dtype=torch.bool, device=device)
+        pair_a_list, pair_f_list = [], []
+
+        for start in range(0, N, max_chunk):
+            end = min(start + max_chunk, N)
+            chunk_min = aabb_min[start:end]  # [C, 3]
+            chunk_max = aabb_max[start:end]
+
+            overlap = (chunk_min.unsqueeze(1) <= face_aabb_max.unsqueeze(0)) & \
+                      (chunk_max.unsqueeze(1) >= face_aabb_min.unsqueeze(0))
+            overlap_all = overlap.all(dim=2)  # [C, F]
+
+            hit[start:end] = overlap_all.any(dim=1)
+
+            if return_pairs:
+                a_ids, f_ids = torch.where(overlap_all)
+                pair_a_list.append(a_ids + start)
+                pair_f_list.append(f_ids)
+
+            del overlap, overlap_all
+
         if return_pairs:
-            aabb_ids, face_ids = torch.where(overlap_all)
+            aabb_ids = torch.cat(pair_a_list) if pair_a_list else torch.empty(0, dtype=torch.long, device=device)
+            face_ids = torch.cat(pair_f_list) if pair_f_list else torch.empty(0, dtype=torch.long, device=device)
             return AABBIntersectResult(hit=hit, aabb_ids=aabb_ids, face_ids=face_ids)
         else:
             return AABBIntersectResult(hit=hit)
