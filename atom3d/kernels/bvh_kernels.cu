@@ -181,25 +181,21 @@ struct Triangle {
         }
     }
     
-    // Ray-triangle intersection
+    // Ray-triangle intersection (float compute, double for u/v edge tests)
     __device__ float ray_intersect(float3 ro, float3 rd) const {
         const float eps = 1e-8f;
         float3 e1 = sub3(b, a);
         float3 e2 = sub3(c, a);
         float3 h = cross3(rd, e2);
         float det = dot3(e1, h);
-        
         if (fabsf(det) < eps) return 1e10f;
-        
         float f = 1.0f / det;
         float3 s = sub3(ro, a);
-        float u = f * dot3(s, h);
-        if (u < 0.0f || u > 1.0f) return 1e10f;
-        
+        double u = (double)f * (double)dot3(s, h);
+        if (u < 0.0 || u > 1.0) return 1e10f;
         float3 q = cross3(s, e1);
-        float v = f * dot3(rd, q);
-        if (v < 0.0f || u + v > 1.0f) return 1e10f;
-        
+        double v = (double)f * (double)dot3(rd, q);
+        if (v < 0.0 || u + v > 1.0) return 1e10f;
         float t = f * dot3(e2, q);
         return (t > eps) ? t : 1e10f;
     }

@@ -919,14 +919,15 @@ class MeshBVH:
             valid = torch.abs(a) > 1e-8
             f = torch.zeros_like(a)
             f[valid] = 1.0 / a[valid]
-            
+
             s = ray_o - v0
-            u = f * (s * h).sum(dim=1)
-            valid &= (u >= 0) & (u <= 1)
-            
+            u = (f * (s * h).sum(dim=1)).double()
+            eps_edge = 1.19209290e-7  # FLT_EPSILON
+            valid &= (u >= -eps_edge) & (u <= 1 + eps_edge)
+
             q = torch.cross(s, edge1)
-            v = f * (ray_d.expand_as(q) * q).sum(dim=1)
-            valid &= (v >= 0) & (u + v <= 1)
+            v = (f * (ray_d.expand_as(q) * q).sum(dim=1)).double()
+            valid &= (v >= -eps_edge) & (u + v <= 1 + eps_edge)
             
             t_hit = f * (edge2 * q).sum(dim=1)
             valid &= (t_hit > 1e-6) & (t_hit < max_t)

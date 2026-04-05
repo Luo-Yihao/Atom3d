@@ -472,31 +472,24 @@ __device__ float ray_triangle_intersect(
     float3 v0, float3 v1, float3 v2,
     float* out_u, float* out_v
 ) {
+    // Float compute, double for u/v edge tests
     const float eps = 1e-8f;
-    
     float3 e1 = sub3(v1, v0);
     float3 e2 = sub3(v2, v0);
     float3 h = cross3(ray_d, e2);
     float a = dot3(e1, h);
-    
     if (fabsf(a) < eps) return -1.0f;
-    
     float f = 1.0f / a;
     float3 s = sub3(ray_o, v0);
-    float u = f * dot3(s, h);
-    
-    if (u < 0.0f || u > 1.0f) return -1.0f;
-    
+    double ud = (double)f * (double)dot3(s, h);
+    if (ud < 0.0 || ud > 1.0) return -1.0f;
     float3 q = cross3(s, e1);
-    float v = f * dot3(ray_d, q);
-    
-    if (v < 0.0f || u + v > 1.0f) return -1.0f;
-    
+    double vd = (double)f * (double)dot3(ray_d, q);
+    if (vd < 0.0 || ud + vd > 1.0) return -1.0f;
     float t = f * dot3(e2, q);
-    
     if (t > eps) {
-        *out_u = u;
-        *out_v = v;
+        *out_u = (float)ud;
+        *out_v = (float)vd;
         return t;
     }
     

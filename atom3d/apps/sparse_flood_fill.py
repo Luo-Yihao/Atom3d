@@ -111,6 +111,11 @@ def sparse_flood_fill(
 ) -> Dict[str, torch.Tensor]:
     """
     CUDA-accelerated sparse flood fill for mesh inside/outside classification.
+
+    WARNING: connectivity=26 can leak through thin walls (1-cell thick).
+    The octree voxelization may miss diagonal cells at triangle edges due to
+    floating-point precision, allowing water to flow diagonally past dam cells.
+    Use connectivity=6 for reliable inside/outside classification on thin-wall meshes.
     """
     if not HAS_CUDA_FLOODFILL:
         raise RuntimeError("CUDA flood fill not available.")
