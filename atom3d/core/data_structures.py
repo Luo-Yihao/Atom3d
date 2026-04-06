@@ -27,7 +27,18 @@ class RayIntersectResult:
     face_ids: torch.Tensor      # [N] int32 (miss=-1)
     hit_points: torch.Tensor    # [N, 3]
     normals: torch.Tensor       # [N, 3]
-    bary_coords: torch.Tensor   # [N, 3]
+    bary_coords: Optional[torch.Tensor] = None  # [N, 3] (only with return_uvw=True)
+
+
+@dataclass
+class RayAllHitResult:
+    """All-hit ray intersection result (variable hits per ray)"""
+    ray_idx: torch.Tensor       # [H] int32 — which ray each hit belongs to
+    t: torch.Tensor             # [H] float32
+    face_ids: torch.Tensor      # [H] int32
+    sign: torch.Tensor          # [H] int32 — sign(dot(face_normal, ray_dir))
+    hit_points: torch.Tensor    # [H, 3]
+    bary_coords: torch.Tensor   # [H, 3]
 
 
 @dataclass

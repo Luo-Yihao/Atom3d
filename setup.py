@@ -42,5 +42,6 @@ setup(
         "Topic :: Scientific/Engineering :: Visualization",
         "Topic :: Scientific/Engineering :: Image Processing",
     ],
+    package_data={"atom3d": ["kernels/*.cu"]},
     include_package_data=True,
 )

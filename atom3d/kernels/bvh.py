@@ -137,7 +137,7 @@ class BVHAccelerator:
             hit_points: [K, 3] hit positions
         """
         cuda = get_bvh_kernels()
-        hit_mask, hit_t, face_ids, hit_points = cuda.bvh_ray_intersect(
+        hit_mask, hit_t, face_ids, hit_points, _uvw = cuda.bvh_ray_intersect(
             self.nodes,
             self.triangles,
             rays_o.contiguous().float(),
@@ -146,6 +146,40 @@ class BVHAccelerator:
         )
         return hit_mask, hit_t, face_ids, hit_points
     
+    def ray_all_hit(
+        self,
+        rays_o: torch.Tensor,
+        rays_d: torch.Tensor,
+        max_t: float = 1e10
+    ):
+        """
+        Ray all-hit query: collect ALL intersections via two-pass BVH traversal.
+
+        Pass 1: count hits per ray.  Pass 2: write hits with prefix-sum offsets.
+        No Python ray-marching loop.
+
+        Args:
+            rays_o: [K, 3] ray origins
+            rays_d: [K, 3] ray directions
+            max_t: Maximum ray distance
+
+        Returns:
+            ray_idx:    [H] int32 — which ray each hit belongs to
+            t:          [H] float — hit distance along ray
+            face_id:    [H] int32 — hit face index (original order)
+            sign:       [H] int32 — sign(dot(face_normal, ray_dir)), +1/-1/0
+            hit_points: [H, 3] float — hit positions
+            uvw:        [H, 3] float — barycentric coordinates at hit
+        """
+        cuda = get_bvh_kernels()
+        return cuda.bvh_ray_all_hit(
+            self.nodes,
+            self.triangles,
+            rays_o.contiguous().float(),
+            rays_d.contiguous().float(),
+            max_t
+        )
+
     def aabb_intersect(
         self,
         query_min: torch.Tensor,

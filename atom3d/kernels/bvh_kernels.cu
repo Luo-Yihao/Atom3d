@@ -475,52 +475,49 @@ __global__ void bvh_ray_intersect_kernel(
     bool* __restrict__ hit_mask,
     float* __restrict__ hit_t,
     int* __restrict__ hit_face_ids,
-    float* __restrict__ hit_points
+    float* __restrict__ hit_points,
+    float* __restrict__ hit_uvw         // [num_rays, 3] (nullable)
 ) {
     int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray_idx >= num_rays) return;
-    
+
     float3 ro = make_float3(rays_o[ray_idx * 3], rays_o[ray_idx * 3 + 1], rays_o[ray_idx * 3 + 2]);
     float3 rd = make_float3(rays_d[ray_idx * 3], rays_d[ray_idx * 3 + 1], rays_d[ray_idx * 3 + 2]);
-    
+
     float mint = max_t;
     int best_face = -1;
-    
+    int best_tri_idx = -1;
+
     int stack[96];
     int stack_ptr = 0;
     stack[stack_ptr++] = 0;
-    
+
     while (stack_ptr > 0) {
         int idx = stack[--stack_ptr];
         const BVHNode& node = nodes[idx];
-        
+
         float tbb = ray_aabb_intersect(ro, rd, node.bb_min, node.bb_max);
         if (tbb >= mint) continue;
-        
+
         if (node.left_idx < 0) {
-            // Leaf
             int start = -node.left_idx - 1;
             int end = -node.right_idx - 1;
-            
+
             for (int i = start; i < end; i++) {
                 float t = triangles[i].ray_intersect(ro, rd);
                 if (t < mint) {
                     mint = t;
                     best_face = triangles[i].original_id;
+                    best_tri_idx = i;
                 }
             }
         } else {
-            // Push children (simple order for ray tracing, could be optimized with front-to-back)
-            // For now, push right then left
             int left = node.left_idx;
             int right = node.right_idx;
-            
-            // We could sort by ray entry time (tbb) to visit closer nodes first (Front-to-Back)
-            // But ray_aabb_intersect handles the check.
-            
+
             float t1 = ray_aabb_intersect(ro, rd, nodes[left].bb_min, nodes[left].bb_max);
             float t2 = ray_aabb_intersect(ro, rd, nodes[right].bb_min, nodes[right].bb_max);
-            
+
             if (t1 < t2) {
                 if (t2 < mint && stack_ptr < 96) stack[stack_ptr++] = right;
                 if (t1 < mint && stack_ptr < 96) stack[stack_ptr++] = left;
@@ -530,15 +527,24 @@ __global__ void bvh_ray_intersect_kernel(
             }
         }
     }
-    
+
     hit_mask[ray_idx] = (best_face >= 0);
     hit_t[ray_idx] = mint;
     hit_face_ids[ray_idx] = best_face;
-    
-    if (hit_points && best_face >= 0) {
-        hit_points[ray_idx * 3 + 0] = ro.x + mint * rd.x;
-        hit_points[ray_idx * 3 + 1] = ro.y + mint * rd.y;
-        hit_points[ray_idx * 3 + 2] = ro.z + mint * rd.z;
+
+    if (best_face >= 0) {
+        float3 hp = add3(ro, mul3(rd, mint));
+        if (hit_points) {
+            hit_points[ray_idx * 3 + 0] = hp.x;
+            hit_points[ray_idx * 3 + 1] = hp.y;
+            hit_points[ray_idx * 3 + 2] = hp.z;
+        }
+        if (hit_uvw && best_tri_idx >= 0) {
+            float3 bary = triangles[best_tri_idx].barycentric(hp);
+            hit_uvw[ray_idx * 3 + 0] = bary.x;
+            hit_uvw[ray_idx * 3 + 1] = bary.y;
+            hit_uvw[ray_idx * 3 + 2] = bary.z;
+        }
     }
 }
 
@@ -917,6 +923,103 @@ std::vector<at::Tensor> build_bvh_cuda(
     return {nodes_tensor.to(vertices.device()), triangles_tensor.to(vertices.device())};
 }
 
+/**
+ * Ray all-hit: two-pass BVH traversal to collect ALL intersections.
+ *
+ * Pass 1 (count_only=true):  count hits per ray → hit_counts[ray]
+ * Pass 2 (count_only=false): write hits using prefix-sum offsets
+ *
+ * Output per hit: ray_idx, t, face_id, sign(dot(face_normal, ray_dir))
+ */
+__global__ void bvh_ray_all_hit_kernel(
+    const BVHNode* __restrict__ nodes,
+    const Triangle* __restrict__ triangles,
+    const float* __restrict__ rays_o,
+    const float* __restrict__ rays_d,
+    int num_rays,
+    float max_t,
+    bool count_only,
+    // Count pass output:
+    int* __restrict__ hit_counts,       // [num_rays]
+    // Collect pass inputs/outputs:
+    const int* __restrict__ offsets,     // [num_rays] prefix-sum offsets (NULL in count pass)
+    int* __restrict__ out_ray_idx,      // [total_hits]
+    float* __restrict__ out_t,          // [total_hits]
+    int* __restrict__ out_face_id,      // [total_hits]
+    int* __restrict__ out_sign,         // [total_hits] +1 or -1
+    float* __restrict__ out_hit_points, // [total_hits, 3] (nullable)
+    float* __restrict__ out_uvw         // [total_hits, 3] (nullable)
+) {
+    int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ray_idx >= num_rays) return;
+
+    float3 ro = make_float3(rays_o[ray_idx * 3], rays_o[ray_idx * 3 + 1], rays_o[ray_idx * 3 + 2]);
+    float3 rd = make_float3(rays_d[ray_idx * 3], rays_d[ray_idx * 3 + 1], rays_d[ray_idx * 3 + 2]);
+
+    int count = 0;
+    int write_pos = count_only ? 0 : offsets[ray_idx];
+
+    int stack[96];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+
+    while (stack_ptr > 0) {
+        int idx = stack[--stack_ptr];
+        const BVHNode& node = nodes[idx];
+
+        float tbb = ray_aabb_intersect(ro, rd, node.bb_min, node.bb_max);
+        if (tbb >= max_t) continue;
+
+        if (node.left_idx < 0) {
+            int start = -node.left_idx - 1;
+            int end = -node.right_idx - 1;
+
+            for (int i = start; i < end; i++) {
+                float t = triangles[i].ray_intersect(ro, rd);
+                if (t > 0.0f && t < max_t) {
+                    // Grazing threshold: skip nearly-parallel hits
+                    float3 n = triangles[i].normal();
+                    float ndotd = dot3(n, rd);
+                    const float graze_eps = 1e-4f;
+                    if (ndotd > -graze_eps && ndotd < graze_eps) continue;
+                    int s = (ndotd > 0.0f) ? 1 : -1;
+                    if (count_only) {
+                        count++;
+                    } else {
+                        out_ray_idx[write_pos] = ray_idx;
+                        out_t[write_pos] = t;
+                        out_face_id[write_pos] = triangles[i].original_id;
+                        out_sign[write_pos] = s;
+                        if (out_hit_points) {
+                            float3 hp = add3(ro, mul3(rd, t));
+                            out_hit_points[write_pos * 3 + 0] = hp.x;
+                            out_hit_points[write_pos * 3 + 1] = hp.y;
+                            out_hit_points[write_pos * 3 + 2] = hp.z;
+                        }
+                        if (out_uvw) {
+                            float3 hp = add3(ro, mul3(rd, t));
+                            float3 bary = triangles[i].barycentric(hp);
+                            out_uvw[write_pos * 3 + 0] = bary.x;
+                            out_uvw[write_pos * 3 + 1] = bary.y;
+                            out_uvw[write_pos * 3 + 2] = bary.z;
+                        }
+                        write_pos++;
+                    }
+                }
+            }
+        } else {
+            int left = node.left_idx;
+            int right = node.right_idx;
+            if (stack_ptr < 95) stack[stack_ptr++] = right;
+            if (stack_ptr < 95) stack[stack_ptr++] = left;
+        }
+    }
+
+    if (count_only) {
+        hit_counts[ray_idx] = count;
+    }
+}
+
 // ============================================================
 // Python Bindings (wrappers)
 // ============================================================
@@ -987,10 +1090,11 @@ std::vector<at::Tensor> bvh_ray_intersect_cuda(
     auto hit_t = torch::full({num_rays}, max_t, opts_float);
     auto hit_face_ids = torch::full({num_rays}, -1, opts_int);
     auto hit_points = torch::empty({num_rays, 3}, opts_float);
-    
+    auto hit_uvw = torch::zeros({num_rays, 3}, opts_float);
+
     int block_size = 256;
     int grid_size = (num_rays + block_size - 1) / block_size;
-    
+
     bvh_ray_intersect_kernel<<<grid_size, block_size, 0, stream>>>(
         reinterpret_cast<const BVHNode*>(nodes.data_ptr<float>()),
         reinterpret_cast<const Triangle*>(triangles.data_ptr<float>()),
@@ -1001,10 +1105,87 @@ std::vector<at::Tensor> bvh_ray_intersect_cuda(
         hit_mask.data_ptr<bool>(),
         hit_t.data_ptr<float>(),
         hit_face_ids.data_ptr<int>(),
-        hit_points.data_ptr<float>()
+        hit_points.data_ptr<float>(),
+        hit_uvw.data_ptr<float>()
     );
-    
-    return {hit_mask, hit_t, hit_face_ids, hit_points};
+
+    return {hit_mask, hit_t, hit_face_ids, hit_points, hit_uvw};
+}
+
+std::vector<at::Tensor> bvh_ray_all_hit_cuda(
+    at::Tensor nodes,
+    at::Tensor triangles,
+    at::Tensor rays_o,
+    at::Tensor rays_d,
+    float max_t
+) {
+    CHECK_INPUT(nodes);
+    CHECK_INPUT(triangles);
+    CHECK_INPUT(rays_o);
+    CHECK_INPUT(rays_d);
+
+    c10::cuda::CUDAGuard device_guard(rays_o.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int num_rays = rays_o.size(0);
+    auto opts_int = rays_o.options().dtype(torch::kInt32);
+    auto opts_float = rays_o.options();
+
+    int block_size = 256;
+    int grid_size = (num_rays + block_size - 1) / block_size;
+
+    const BVHNode* d_nodes = reinterpret_cast<const BVHNode*>(nodes.data_ptr<float>());
+    const Triangle* d_tris = reinterpret_cast<const Triangle*>(triangles.data_ptr<float>());
+
+    // Pass 1: count hits per ray
+    auto hit_counts = torch::zeros({num_rays}, opts_int);
+    bvh_ray_all_hit_kernel<<<grid_size, block_size, 0, stream>>>(
+        d_nodes, d_tris,
+        rays_o.data_ptr<float>(), rays_d.data_ptr<float>(),
+        num_rays, max_t, /*count_only=*/true,
+        hit_counts.data_ptr<int>(),
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr
+    );
+
+    // Prefix sum → offsets (cumsum promotes to int64, cast back to int32)
+    auto offsets = (hit_counts.to(torch::kInt64).cumsum(0) - hit_counts.to(torch::kInt64)).to(torch::kInt32);
+    int total_hits = (offsets[-1].item<int>() + hit_counts[-1].item<int>());
+
+    if (total_hits == 0) {
+        return {
+            torch::empty({0}, opts_int),        // ray_idx
+            torch::empty({0}, opts_float),      // t
+            torch::empty({0}, opts_int),        // face_id
+            torch::empty({0}, opts_int),        // sign
+            torch::empty({0, 3}, opts_float),   // hit_points
+            torch::empty({0, 3}, opts_float),   // uvw
+        };
+    }
+
+    // Pass 2: collect hits
+    auto out_ray_idx    = torch::empty({total_hits}, opts_int);
+    auto out_t          = torch::empty({total_hits}, opts_float);
+    auto out_face_id    = torch::empty({total_hits}, opts_int);
+    auto out_sign       = torch::empty({total_hits}, opts_int);
+    auto out_hit_points = torch::empty({total_hits, 3}, opts_float);
+    auto out_uvw        = torch::empty({total_hits, 3}, opts_float);
+
+    bvh_ray_all_hit_kernel<<<grid_size, block_size, 0, stream>>>(
+        d_nodes, d_tris,
+        rays_o.data_ptr<float>(), rays_d.data_ptr<float>(),
+        num_rays, max_t, /*count_only=*/false,
+        nullptr,
+        offsets.data_ptr<int>(),
+        out_ray_idx.data_ptr<int>(),
+        out_t.data_ptr<float>(),
+        out_face_id.data_ptr<int>(),
+        out_sign.data_ptr<int>(),
+        out_hit_points.data_ptr<float>(),
+        out_uvw.data_ptr<float>()
+    );
+
+    return {out_ray_idx, out_t, out_face_id, out_sign, out_hit_points, out_uvw};
 }
 
 std::vector<at::Tensor> bvh_aabb_intersect_cuda(
@@ -1063,5 +1244,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("build_bvh", &build_bvh_cuda, "Build BVH from mesh");
     m.def("bvh_udf", &bvh_udf_cuda, "BVH UDF query");
     m.def("bvh_ray_intersect", &bvh_ray_intersect_cuda, "BVH ray intersection");
+    m.def("bvh_ray_all_hit", &bvh_ray_all_hit_cuda, "BVH ray all-hit (two-pass)");
     m.def("bvh_aabb_intersect", &bvh_aabb_intersect_cuda, "BVH AABB intersection");
 }
