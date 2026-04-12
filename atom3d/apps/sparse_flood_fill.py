@@ -107,6 +107,7 @@ def sparse_flood_fill(
     connectivity: int = 26,
     min_level: int = 0,
     k_ring: int = 1,
+    bounds: 'Optional[torch.Tensor]' = None,
     verbose: bool = True
 ) -> Dict[str, torch.Tensor]:
     """
@@ -116,16 +117,21 @@ def sparse_flood_fill(
     The octree voxelization may miss diagonal cells at triangle edges due to
     floating-point precision, allowing water to flow diagonally past dam cells.
     Use connectivity=6 for reliable inside/outside classification on thin-wall meshes.
+
+    Args:
+        bounds: Optional [2, 3] tensor [[min_x,min_y,min_z],[max_x,max_y,max_z]].
+                If provided, the octree covers this box instead of the default [-1,1]^3.
+                Use tight mesh-bbox bounds to maximize effective voxel resolution.
     """
     if not HAS_CUDA_FLOODFILL:
         raise RuntimeError("CUDA flood fill not available.")
-    
+
     from ..kernels.flood_fill import flood_fill_3d_sparse
     import time
-    
+
     device = bvh.device
     max_level = int(np.log2(resolution))
-    octree = OctreeIndexer(max_level=max_level, device=device)
+    octree = OctreeIndexer(max_level=max_level, bounds=bounds, device=device)
     
     # 1. Intersected voxels
     all_intersected_ijk = octree.octree_traverse(bvh, min_level=min_level)

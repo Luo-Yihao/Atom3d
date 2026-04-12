@@ -796,31 +796,25 @@ class SparseDiffDMC(nn.Module):
             quad_vd_idx[flip_mask] = quad_vd_idx[flip_mask][:, [0, 1, 3, 2]]
             quad_vd_idx[~flip_mask] = quad_vd_idx[~flip_mask][:, [2, 3, 1, 0]]
 
-        # Gamma for quad split decision (aligned with official FlexiCubes)
-        quad_gamma = torch.index_select(input=vd_gamma, index=quad_vd_idx.reshape(-1), dim=0).reshape(-1, 4)
-        gamma_02 = quad_gamma[:, 0:1] * quad_gamma[:, 2:3]  # [N, 1]
-        gamma_13 = quad_gamma[:, 1:2] * quad_gamma[:, 3:4]  # [N, 1]
+        # Quad vertex positions (needed for both training and eval)
+        vd_quad = torch.index_select(input=vd, index=quad_vd_idx.reshape(-1), dim=0).reshape(-1, 4, 3)
 
         if not training:
-            mask = (gamma_02 > gamma_13).squeeze(1)
-            faces = torch.zeros((quad_gamma.shape[0], 6), dtype=torch.long, device=self.device)
+            # Eval: 2-tri split, shorter diagonal (geometric criterion)
+            len_02 = (vd_quad[:, 0] - vd_quad[:, 2]).norm(dim=1)
+            len_13 = (vd_quad[:, 1] - vd_quad[:, 3]).norm(dim=1)
+            mask = len_02 < len_13  # pick shorter diagonal
+            faces = torch.zeros((vd_quad.shape[0], 6), dtype=torch.long, device=self.device)
             faces[mask] = quad_vd_idx[mask][:, self.quad_split_1]
             faces[~mask] = quad_vd_idx[~mask][:, self.quad_split_2]
             faces = faces.reshape(-1, 3)
         else:
-            vd_quad = torch.index_select(input=vd, index=quad_vd_idx.reshape(-1), dim=0).reshape(-1, 4, 3)
-            vd_02 = (vd_quad[:, 0:1] + vd_quad[:, 2:3]) / 2
-            vd_13 = (vd_quad[:, 1:2] + vd_quad[:, 3:4]) / 2
-            weight_sum = (gamma_02 + gamma_13) + 1e-8
-            vd_center = ((vd_02 * gamma_02.unsqueeze(-1) + vd_13 * gamma_13.unsqueeze(-1)) /
-                         weight_sum.unsqueeze(-1)).squeeze(1)
+            # Training: 4-tri split, center = mean of 4 vertices (no gamma needed)
+            vd_center = vd_quad.mean(dim=1)  # [N, 3] centroid
 
             if vd_features is not None:
                 feat_quad = vd_features[quad_vd_idx.reshape(-1)].reshape(-1, 4, vd_features.shape[-1])
-                feat_02 = (feat_quad[:, 0:1] + feat_quad[:, 2:3]) / 2
-                feat_13 = (feat_quad[:, 1:2] + feat_quad[:, 3:4]) / 2
-                feat_center = ((feat_02 * gamma_02.unsqueeze(-1) + feat_13 * gamma_13.unsqueeze(-1)) /
-                               weight_sum.unsqueeze(-1)).squeeze(1)
+                feat_center = feat_quad.mean(dim=1)
                 vd_features = torch.cat([vd_features, feat_center])
 
             vd_center_idx = torch.arange(vd_center.shape[0], device=self.device) + vd.shape[0]
