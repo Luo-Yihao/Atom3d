@@ -53,9 +53,18 @@ def get_cuda_kernels():
     kernel_file = os.path.join(kernel_dir, 'cumtv_kernels.cu')
     if not os.path.exists(kernel_file):
         raise RuntimeError(f"CUDA kernel file not found: {kernel_file}")
-    
+
     os.makedirs(build_dir, exist_ok=True)
-    
+
+    # Auto-detect GPU arch to avoid compiling all archs
+    if 'TORCH_CUDA_ARCH_LIST' not in os.environ:
+        caps = set()
+        for i in range(torch.cuda.device_count()):
+            major, minor = torch.cuda.get_device_capability(i)
+            caps.add(f"{major}.{minor}")
+        if caps:
+            os.environ['TORCH_CUDA_ARCH_LIST'] = ';'.join(sorted(caps))
+
     _cumtv_cuda = load(
         name='cumtv_cuda',
         sources=[kernel_file],
