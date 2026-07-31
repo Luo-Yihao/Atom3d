@@ -32,10 +32,18 @@ def get_cuda_kernels():
     kernel_dir = os.path.dirname(os.path.abspath(__file__))
     build_dir = os.path.join(kernel_dir, 'build')
     so_file = os.path.join(build_dir, 'cumtv_cuda.so')
-    
-    # Fast path: if .so exists and matches current torch + CUDA, load directly
+
+    # Fast path: if .so exists and matches current torch + CUDA + kernel
+    # source, load directly. The source hash is part of the tag so a cached
+    # .so is never silently reused after cumtv_kernels.cu changes.
+    kernel_file_for_tag = os.path.join(kernel_dir, 'cumtv_kernels.cu')
+    if not os.path.exists(kernel_file_for_tag):
+        raise RuntimeError(f"CUDA kernel file not found: {kernel_file_for_tag}")
+    import hashlib
+    with open(kernel_file_for_tag, 'rb') as f:
+        src_hash = hashlib.sha256(f.read()).hexdigest()[:16]
     tag_file = os.path.join(build_dir, '.build_tag')
-    torch_tag = f"{torch.__version__}_{torch.version.cuda}_{torch.cuda.get_arch_list()}"
+    torch_tag = f"{torch.__version__}_{torch.version.cuda}_{torch.cuda.get_arch_list()}_{src_hash}"
     tag_ok = False
     if os.path.exists(tag_file):
         with open(tag_file) as f:
@@ -205,12 +213,19 @@ def sat_clip_polygon(aabbs_min, aabbs_max, tris_verts, cand_a, cand_t, mode=1, e
     
     Returns:
         hit_mask: [N] bool - True if intersection exists
-        poly_counts: [N] int32 - Number of vertices in clipped polygon
+        poly_counts: [N] int32 - Number of vertices stored in poly_verts
         poly_verts: [N, 8, 3] float32 - Polygon vertices (only if mode=2)
         centroids: [N, 3] float32 - Centroid of clipped polygon (projected to triangle)
         areas: [N] float32 - Area of clipped polygon
         out_a_idx: [N] int64 - AABB indices
         out_t_idx: [N] int64 - Triangle indices
+
+    Note:
+        A triangle clipped by a box yields up to 9 vertices. The clip itself
+        runs at full precision (centroids and areas are computed from ALL
+        vertices), but poly_verts holds at most 8, so 9-gons export their
+        first 8 vertices and poly_counts reports 8 (consistent with what is
+        stored).
     """
     cuda = get_cuda_kernels()
     return cuda.sat_clip_polygon(

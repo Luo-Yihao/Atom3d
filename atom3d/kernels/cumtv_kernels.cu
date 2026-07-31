@@ -11,6 +11,8 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -190,11 +192,19 @@ __global__ void triangle_aabb_intersect_kernel(
 // Sutherland-Hodgman polygon clipping for precise intersection
 // ============================================================
 
+// Output layout of poly_verts is [N, MAX_CLIP_VERTS, 3] — part of the public
+// interface, do not change. Internal clip buffers use MAX_WORK_VERTS: a
+// triangle clipped by the 6 planes of a box has at most 3 + 6 = 9 vertices,
+// so 10 guarantees the Sutherland-Hodgman passes can never overflow (the old
+// 8-vertex buffers overflowed the stack on 9-gon configurations: the
+// !inP && inQ branch writes two vertices per edge with only an end-of-edge
+// capacity check).
 #define MAX_CLIP_VERTS 8
+#define MAX_WORK_VERTS 10
 
 /**
  * Clip polygon against a plane using Sutherland-Hodgman algorithm
- * 
+ *
  * @param in_poly: input polygon vertices [MAXV][3]
  * @param in_count: number of input vertices
  * @param n: plane normal [3]
@@ -210,18 +220,21 @@ __device__ __forceinline__ int clip_with_plane(
     float out_poly[MAXV][3], float eps
 ) {
     if (in_count <= 0) return 0;
-    
+
     float dist[MAXV];
     bool inside[MAXV];
-    
+
     #pragma unroll
     for (int i = 0; i < in_count; ++i) {
         dist[i] = in_poly[i][0] * n[0] + in_poly[i][1] * n[1] + in_poly[i][2] * n[2] - d;
         inside[i] = (dist[i] <= eps);
     }
-    
+
     int out_count = 0;
-    
+
+    // Capacity is checked BEFORE every write. With MAXV >= 10 and a triangle
+    // input the guards never trigger (worst case is 9 vertices); they only
+    // protect future callers that feed larger polygons.
     #pragma unroll
     for (int i = 0; i < in_count; ++i) {
         int j = (i + 1 == in_count) ? 0 : (i + 1);
@@ -229,8 +242,9 @@ __device__ __forceinline__ int clip_with_plane(
         const float* Q = in_poly[j];
         float dP = dist[i], dQ = dist[j];
         bool inP = inside[i], inQ = inside[j];
-        
+
         if (inP && inQ) {
+            if (out_count >= MAXV) return out_count;
             out_poly[out_count][0] = Q[0];
             out_poly[out_count][1] = Q[1];
             out_poly[out_count][2] = Q[2];
@@ -238,6 +252,7 @@ __device__ __forceinline__ int clip_with_plane(
         } else if (inP && !inQ) {
             float denom = dP - dQ;
             if (fabsf(denom) > eps) {
+                if (out_count >= MAXV) return out_count;
                 float t = dP / denom;
                 out_poly[out_count][0] = P[0] + t * (Q[0] - P[0]);
                 out_poly[out_count][1] = P[1] + t * (Q[1] - P[1]);
@@ -247,19 +262,19 @@ __device__ __forceinline__ int clip_with_plane(
         } else if (!inP && inQ) {
             float denom = dP - dQ;
             if (fabsf(denom) > eps) {
+                if (out_count >= MAXV) return out_count;
                 float t = dP / denom;
                 out_poly[out_count][0] = P[0] + t * (Q[0] - P[0]);
                 out_poly[out_count][1] = P[1] + t * (Q[1] - P[1]);
                 out_poly[out_count][2] = P[2] + t * (Q[2] - P[2]);
                 ++out_count;
             }
+            if (out_count >= MAXV) return out_count;
             out_poly[out_count][0] = Q[0];
             out_poly[out_count][1] = Q[1];
             out_poly[out_count][2] = Q[2];
             ++out_count;
         }
-        
-        if (out_count >= MAXV) return MAXV;
     }
     return out_count;
 }
@@ -312,21 +327,22 @@ __global__ void sat_clip_polygon_kernel(
         tri[v][2] = tv[2];
     }
     
-    // Initialize polygon = triangle
-    float polyA[MAX_CLIP_VERTS][3], polyB[MAX_CLIP_VERTS][3];
+    // Initialize polygon = triangle (work buffers hold the full clip result,
+    // up to 9 vertices; only the first MAX_CLIP_VERTS are exported)
+    float polyA[MAX_WORK_VERTS][3], polyB[MAX_WORK_VERTS][3];
     int nA = 3;
     for (int i = 0; i < 3; ++i) {
         polyA[i][0] = tri[i][0];
         polyA[i][1] = tri[i][1];
         polyA[i][2] = tri[i][2];
     }
-    
+
     // Clip against 6 AABB faces
     const float nxp[3] = {1, 0, 0}, nyp[3] = {0, 1, 0}, nzp[3] = {0, 0, 1};
     const float nxn[3] = {-1, 0, 0}, nyn[3] = {0, -1, 0}, nzn[3] = {0, 0, -1};
-    
+
     // P0-1 FIX: Replaced lambda with direct macro to avoid CUDA compatibility issues
-    #define CLIP_ONCE(inP, inN, n, d, outP) clip_with_plane<MAX_CLIP_VERTS>(inP, inN, n, d, outP, eps)
+    #define CLIP_ONCE(inP, inN, n, d, outP) clip_with_plane<MAX_WORK_VERTS>(inP, inN, n, d, outP, eps)
     
     int nB;
     nB = CLIP_ONCE(polyA, nA, nxp, bmax[0], polyB); nA = nB;
@@ -349,14 +365,18 @@ __global__ void sat_clip_polygon_kernel(
     
     // Hit!
     hit_mask[k] = true;
+    // cnt = full polygon vertex count (up to 9); centroid and area below use
+    // ALL vertices. The exported poly_verts buffer is [MAX_CLIP_VERTS, 3], so
+    // polygons with more vertices store only the first MAX_CLIP_VERTS and
+    // poly_counts reports the stored count (kept consistent with poly_verts).
     int cnt = nA;
-    if (cnt > MAX_CLIP_VERTS) cnt = MAX_CLIP_VERTS;
-    poly_counts[k] = cnt;
-    
+    int cnt_store = (cnt < MAX_CLIP_VERTS) ? cnt : MAX_CLIP_VERTS;
+    poly_counts[k] = cnt_store;
+
     // Store polygon vertices if mode == 2
     if (mode == 2 && poly_verts != nullptr) {
         for (int i = 0; i < MAX_CLIP_VERTS; ++i) {
-            if (i < cnt) {
+            if (i < cnt_store) {
                 poly_verts[(k * MAX_CLIP_VERTS + i) * 3 + 0] = polyA[i][0];
                 poly_verts[(k * MAX_CLIP_VERTS + i) * 3 + 1] = polyA[i][1];
                 poly_verts[(k * MAX_CLIP_VERTS + i) * 3 + 2] = polyA[i][2];
@@ -824,34 +844,56 @@ std::vector<at::Tensor> triangle_aabb_intersect_cuda(
     
     auto hit_mask = torch::zeros({num_aabbs}, opts_bool);
     
-    // Pre-allocate output buffers
+    // Pre-allocate output buffers (heuristic first-pass capacity)
     int64_t max_hits = (int64_t)num_aabbs * num_faces;  // Worst case
     max_hits = std::min(max_hits, (int64_t)num_aabbs * 100);  // Reasonable limit
-    
+
     auto aabb_ids = torch::empty({max_hits}, opts_int);
     auto face_ids = torch::empty({max_hits}, opts_int);
     auto hit_counter = torch::zeros({1}, opts_int);
-    
-    // Launch kernel
+
+    // Launch kernel on the caller's device/stream so the counter readback
+    // below is correctly ordered after the kernel (matches bvh_kernels.cu)
+    c10::cuda::CUDAGuard device_guard(vertices.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     int block_size = 256;
     dim3 grid(num_aabbs, (num_faces + block_size - 1) / block_size);
-    
-    triangle_aabb_intersect_kernel<<<grid, block_size>>>(
-        vertices.data_ptr<float>(),
-        faces.data_ptr<int>(),
-        aabb_min.data_ptr<float>(),
-        aabb_max.data_ptr<float>(),
-        num_faces,
-        num_aabbs,
-        (int)max_hits,  // P0-3 FIX: Pass max_hits for bounds check
-        hit_mask.data_ptr<bool>(),
-        aabb_ids.data_ptr<int>(),
-        face_ids.data_ptr<int>(),
-        hit_counter.data_ptr<int>()
-    );
-    
-    int final_hits = hit_counter[0].item<int>();
-    
+
+    auto launch = [&]() {
+        triangle_aabb_intersect_kernel<<<grid, block_size, 0, stream>>>(
+            vertices.data_ptr<float>(),
+            faces.data_ptr<int>(),
+            aabb_min.data_ptr<float>(),
+            aabb_max.data_ptr<float>(),
+            num_faces,
+            num_aabbs,
+            (int)max_hits,  // P0-3 FIX: Pass max_hits for bounds check
+            hit_mask.data_ptr<bool>(),
+            aabb_ids.data_ptr<int>(),
+            face_ids.data_ptr<int>(),
+            hit_counter.data_ptr<int>()
+        );
+    };
+    launch();
+
+    int64_t final_hits = hit_counter[0].item<int>();
+    // The atomic counter holds the TRUE pair count even when it exceeds the
+    // buffer (writes beyond capacity are skipped, not wrapped). Silently
+    // returning a truncated pair list would drop intersections on dense
+    // meshes (> 100 faces per box on average), so grow to the exact count
+    // and re-run once.
+    TORCH_CHECK(final_hits >= 0,
+                "triangle_aabb_intersect: hit counter overflowed int32 (",
+                final_hits, "); pair count exceeds 2^31");
+    if (final_hits > max_hits) {
+        max_hits = final_hits;
+        aabb_ids = torch::empty({max_hits}, opts_int);
+        face_ids = torch::empty({max_hits}, opts_int);
+        hit_counter.zero_();
+        launch();
+        final_hits = hit_counter[0].item<int>();
+    }
+
     return {
         hit_mask,
         aabb_ids.slice(0, 0, final_hits),
@@ -892,11 +934,13 @@ std::vector<at::Tensor> ray_mesh_intersect_cuda(
     auto hit_face_ids = torch::full({num_rays}, -1, opts_int);
     auto hit_points = torch::zeros({num_rays, 3}, opts_float);
     auto hit_uvs = torch::zeros({num_rays, 2}, opts_float);
-    
+
+    c10::cuda::CUDAGuard device_guard(vertices.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     int block_size = 256;
     int grid_size = (num_rays + block_size - 1) / block_size;
-    
-    ray_mesh_intersect_kernel<<<grid_size, block_size>>>(
+
+    ray_mesh_intersect_kernel<<<grid_size, block_size, 0, stream>>>(
         vertices.data_ptr<float>(),
         faces.data_ptr<int>(),
         rays_o.data_ptr<float>(),
@@ -941,11 +985,13 @@ std::vector<at::Tensor> point_mesh_udf_cuda(
     auto closest_face_ids = torch::zeros({num_points}, opts_int);
     auto closest_points = torch::zeros({num_points, 3}, opts_float);
     auto uvw = torch::zeros({num_points, 3}, opts_float);
-    
+
+    c10::cuda::CUDAGuard device_guard(vertices.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     int block_size = 256;
     int grid_size = (num_points + block_size - 1) / block_size;
-    
-    point_mesh_udf_kernel<<<grid_size, block_size>>>(
+
+    point_mesh_udf_kernel<<<grid_size, block_size, 0, stream>>>(
         vertices.data_ptr<float>(),
         faces.data_ptr<int>(),
         points.data_ptr<float>(),
@@ -985,37 +1031,56 @@ std::vector<at::Tensor> segment_tri_intersect_cuda(
     int num_tris = tri_verts.size(0);
     
     int64_t max_hits = (int64_t)num_segs * 12 + 8192;
-    
+
     auto opts_long = seg_verts.options().dtype(torch::kInt64);
     auto opts_float = seg_verts.options();
     auto opts_int = seg_verts.options().dtype(torch::kInt32);
-    
+
     auto out_seg_ids = torch::empty({max_hits}, opts_long);
     auto out_tri_ids = torch::empty({max_hits}, opts_long);
     auto out_t = torch::empty({max_hits}, opts_float);
     auto counter = torch::zeros({1}, opts_int);
-    
+
+    c10::cuda::CUDAGuard device_guard(seg_verts.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     dim3 blocks(num_segs);
     int threads = FUSED_TILE_SIZE;
     size_t smem = threads * 3 * 2 * sizeof(float);
-    
-    segment_tri_intersection_kernel<<<blocks, threads, smem>>>(
-        seg_verts.data_ptr<float>(),
-        tri_verts.data_ptr<float>(),
-        tri_aabb_min.data_ptr<float>(),
-        tri_aabb_max.data_ptr<float>(),
-        num_segs,
-        num_tris,
-        (int)max_hits,  // P0 FIX: pass max_hits for bounds check
-        eps,
-        out_seg_ids.data_ptr<long>(),
-        out_tri_ids.data_ptr<long>(),
-        out_t.data_ptr<float>(),
-        counter.data_ptr<int>()
-    );
-    
-    int final_hits = counter[0].item<int>();
-    
+
+    auto launch = [&]() {
+        segment_tri_intersection_kernel<<<blocks, threads, smem, stream>>>(
+            seg_verts.data_ptr<float>(),
+            tri_verts.data_ptr<float>(),
+            tri_aabb_min.data_ptr<float>(),
+            tri_aabb_max.data_ptr<float>(),
+            num_segs,
+            num_tris,
+            (int)max_hits,  // P0 FIX: pass max_hits for bounds check
+            eps,
+            out_seg_ids.data_ptr<long>(),
+            out_tri_ids.data_ptr<long>(),
+            out_t.data_ptr<float>(),
+            counter.data_ptr<int>()
+        );
+    };
+    launch();
+
+    int64_t final_hits = counter[0].item<int>();
+    // Grow to the exact hit count and re-run once instead of silently
+    // dropping hits past the heuristic capacity (see triangle_aabb_intersect).
+    TORCH_CHECK(final_hits >= 0,
+                "segment_tri_intersect: hit counter overflowed int32 (",
+                final_hits, "); hit count exceeds 2^31");
+    if (final_hits > max_hits) {
+        max_hits = final_hits;
+        out_seg_ids = torch::empty({max_hits}, opts_long);
+        out_tri_ids = torch::empty({max_hits}, opts_long);
+        out_t = torch::empty({max_hits}, opts_float);
+        counter.zero_();
+        launch();
+        final_hits = counter[0].item<int>();
+    }
+
     return {
         out_seg_ids.slice(0, 0, final_hits),
         out_tri_ids.slice(0, 0, final_hits),
@@ -1075,10 +1140,12 @@ std::vector<at::Tensor> sat_clip_polygon_cuda(
         poly_verts = torch::empty({0}, opts_float);
     }
     
+    c10::cuda::CUDAGuard device_guard(aabbs_min.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     int block_size = 256;
     int grid_size = (K + block_size - 1) / block_size;
-    
-    sat_clip_polygon_kernel<<<grid_size, block_size>>>(
+
+    sat_clip_polygon_kernel<<<grid_size, block_size, 0, stream>>>(
         aabbs_min.data_ptr<float>(),
         aabbs_max.data_ptr<float>(),
         tris_verts.data_ptr<float>(),

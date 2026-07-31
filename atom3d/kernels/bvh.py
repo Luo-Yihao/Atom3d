@@ -26,20 +26,33 @@ def get_bvh_kernels():
         return _bvh_cuda
     
     so_file = os.path.join(_BUILD_DIR, 'bvh_cuda.so')
-    
-    # Fast path: if .so exists, load directly
-    if os.path.exists(so_file):
+    kernel_path = os.path.join(_KERNEL_DIR, 'bvh_kernels.cu')
+
+    # Fast path: load the cached .so only if it was built from the current
+    # kernel source (and torch/CUDA env) — otherwise a stale binary would
+    # silently shadow source changes. Tag formula matches kernels/__init__.py.
+    import hashlib
+    if not os.path.exists(kernel_path):
+        raise RuntimeError(f"CUDA kernel file not found: {kernel_path}")
+    with open(kernel_path, 'rb') as f:
+        src_hash = hashlib.sha256(f.read()).hexdigest()[:16]
+    tag = f"{torch.__version__}_{torch.version.cuda}_{torch.cuda.get_arch_list()}_{src_hash}"
+    tag_file = os.path.join(_BUILD_DIR, '.build_tag')
+    tag_ok = False
+    if os.path.exists(tag_file):
+        with open(tag_file) as f:
+            tag_ok = f.read().strip() == tag
+
+    if os.path.exists(so_file) and tag_ok:
         import importlib.util
         spec = importlib.util.spec_from_file_location('bvh_cuda', so_file)
         _bvh_cuda = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(_bvh_cuda)
         return _bvh_cuda
-    
+
     # Slow path: JIT compile
     os.makedirs(_BUILD_DIR, exist_ok=True)
-    
-    kernel_path = os.path.join(_KERNEL_DIR, 'bvh_kernels.cu')
-    
+
     _bvh_cuda = load(
         name='bvh_cuda',
         sources=[kernel_path],
@@ -47,7 +60,10 @@ def get_bvh_kernels():
         extra_cuda_cflags=['-O3', '--use_fast_math'],
         verbose=False
     )
-    
+
+    with open(tag_file, 'w') as f:
+        f.write(tag)
+
     return _bvh_cuda
 
 

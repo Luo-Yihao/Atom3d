@@ -1215,25 +1215,44 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     auto hit_aabb_ids = torch::empty({max_hits}, opts_int);
     auto hit_face_ids = torch::empty({max_hits}, opts_int);
     auto hit_counter = torch::zeros({1}, opts_int);
-    
+
     int block_size = 256;
     int grid_size = (num_queries + block_size - 1) / block_size;
-    
-    bvh_aabb_intersect_kernel<<<grid_size, block_size, 0, stream>>>(
-        reinterpret_cast<const BVHNode*>(nodes.data_ptr<float>()),
-        reinterpret_cast<const Triangle*>(triangles.data_ptr<float>()),
-        query_min.data_ptr<float>(),
-        query_max.data_ptr<float>(),
-        num_queries,
-        hit_mask.data_ptr<bool>(),
-        hit_aabb_ids.data_ptr<int>(),
-        hit_face_ids.data_ptr<int>(),
-        hit_counter.data_ptr<int>(),
-        max_hits
-    );
-    
-    int final_hits = std::min(hit_counter[0].item<int>(), (int)max_hits);
-    
+
+    auto launch = [&]() {
+        bvh_aabb_intersect_kernel<<<grid_size, block_size, 0, stream>>>(
+            reinterpret_cast<const BVHNode*>(nodes.data_ptr<float>()),
+            reinterpret_cast<const Triangle*>(triangles.data_ptr<float>()),
+            query_min.data_ptr<float>(),
+            query_max.data_ptr<float>(),
+            num_queries,
+            hit_mask.data_ptr<bool>(),
+            hit_aabb_ids.data_ptr<int>(),
+            hit_face_ids.data_ptr<int>(),
+            hit_counter.data_ptr<int>(),
+            max_hits
+        );
+    };
+    launch();
+
+    int64_t final_hits = hit_counter[0].item<int>();
+    // The counter holds the TRUE pair count (out-of-capacity writes are
+    // skipped, not wrapped). This is the primary broadphase for
+    // MeshBVH.intersect_aabb — silently truncating the pair list makes
+    // downstream clipping miss real intersections on dense meshes, so grow
+    // to the exact count and re-run once.
+    TORCH_CHECK(final_hits >= 0,
+                "bvh_aabb_intersect: hit counter overflowed int32 (",
+                final_hits, "); pair count exceeds 2^31");
+    if (final_hits > max_hits) {
+        max_hits = final_hits;
+        hit_aabb_ids = torch::empty({max_hits}, opts_int);
+        hit_face_ids = torch::empty({max_hits}, opts_int);
+        hit_counter.zero_();
+        launch();
+        final_hits = hit_counter[0].item<int>();
+    }
+
     return {
         hit_mask,
         hit_aabb_ids.slice(0, 0, final_hits),
