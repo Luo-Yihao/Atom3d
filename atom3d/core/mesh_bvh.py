@@ -361,7 +361,8 @@ class MeshBVH:
         if self._bvh is not None:
             try:
                 hit_mask, aabb_ids, face_ids = self._bvh.aabb_intersect(
-                    aabb_min.contiguous(), aabb_max.contiguous(), eps=eps
+                    aabb_min.contiguous(), aabb_max.contiguous(), eps=eps,
+                    pairs=return_pairs
                 )
                 if return_pairs:
                     return AABBIntersectResult(hit=hit_mask, aabb_ids=aabb_ids, face_ids=face_ids)

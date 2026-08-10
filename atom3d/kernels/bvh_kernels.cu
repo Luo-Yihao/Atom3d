@@ -560,6 +560,7 @@ __global__ void bvh_aabb_intersect_kernel(
     const float* __restrict__ query_max,
     int num_queries,
     float sat_eps,
+    bool mask_only,
     bool* __restrict__ hit_mask,
     int* __restrict__ hit_aabb_ids,
     int* __restrict__ hit_face_ids,
@@ -598,7 +599,15 @@ __global__ void bvh_aabb_intersect_kernel(
             for (int i = start; i < end; i++) {
                 if (triangle_aabb_sat(triangles[i], q_min, q_max, sat_eps)) {
                     any_hit = true;
-                    
+                    if (mask_only) {
+                        // The caller wants one bit per query. Emitting pairs
+                        // anyway is quadratic pain for an octree broadphase:
+                        // a coarse cell overlaps millions of triangles, the
+                        // pair buffer overflows and the whole batch reruns.
+                        // First hit answers the question - stop the walk.
+                        stack_ptr = 0;
+                        break;
+                    }
                     int write_idx = atomicAdd(hit_counter, 1);
                     if (write_idx < max_hits) {
                         hit_aabb_ids[write_idx] = q_idx;
@@ -1206,7 +1215,8 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     at::Tensor triangles,
     at::Tensor query_min,
     at::Tensor query_max,
-    double sat_eps
+    double sat_eps,
+    bool mask_only
 ) {
     CHECK_INPUT(nodes);
     CHECK_INPUT(triangles);
@@ -1224,7 +1234,8 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     
     auto hit_mask = torch::zeros({num_queries}, opts_bool);
     
-    int64_t max_hits = std::min((int64_t)num_queries * 100, (int64_t)50000000);
+    int64_t max_hits = mask_only ? 1
+        : std::min((int64_t)num_queries * 100, (int64_t)50000000);
     auto hit_aabb_ids = torch::empty({max_hits}, opts_int);
     auto hit_face_ids = torch::empty({max_hits}, opts_int);
     auto hit_counter = torch::zeros({1}, opts_int);
@@ -1241,6 +1252,7 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
             query_max.data_ptr<float>(),
             num_queries,
             (float)sat_eps,
+            mask_only,
             hit_mask.data_ptr<bool>(),
             hit_aabb_ids.data_ptr<int>(),
             hit_face_ids.data_ptr<int>(),
@@ -1251,6 +1263,11 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     };
     launch();
 
+    if (mask_only) {
+        TORCH_CHECK(stack_overflow[0].item<int>() == 0,
+                    "bvh_aabb_intersect: traversal stack overflowed");
+        return {hit_mask, hit_aabb_ids.slice(0, 0, 0), hit_face_ids.slice(0, 0, 0)};
+    }
     int64_t final_hits = hit_counter[0].item<int>();
     // The counter holds the TRUE pair count (out-of-capacity writes are
     // skipped, not wrapped). This is the primary broadphase for

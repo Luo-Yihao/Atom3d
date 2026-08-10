@@ -99,14 +99,21 @@ class BVHAccelerator:
         self.num_faces = faces.shape[0]
         
         # Build BVH - returns (nodes, triangles with original_id)
-        cuda = get_bvh_kernels()
-        result = cuda.build_bvh(
-            self.vertices,
-            self.faces,
-            n_primitives_per_leaf
-        )
-        self.nodes = result[0]        # [num_nodes, 9]
-        self.triangles = result[1]    # [num_faces, 10] - includes original_id
+        built = None
+        if self.vertices.is_cuda and self.num_faces > 0:
+            built = _build_lbvh_torch(
+                self.vertices, self.faces, n_primitives_per_leaf)
+        if built is not None:
+            self.nodes, self.triangles = built
+        else:
+            cuda = get_bvh_kernels()
+            result = cuda.build_bvh(
+                self.vertices,
+                self.faces,
+                n_primitives_per_leaf
+            )
+            self.nodes = result[0]        # [num_nodes, 9]
+            self.triangles = result[1]    # [num_faces, 10] - includes original_id
     
     def udf(
         self,
@@ -200,7 +207,8 @@ class BVHAccelerator:
         self,
         query_min: torch.Tensor,
         query_max: torch.Tensor,
-        eps: float = 1e-6
+        eps: float = 1e-6,
+        pairs: bool = True
     ):
         """
         AABB-mesh intersection with exact SAT test.
@@ -220,9 +228,163 @@ class BVHAccelerator:
             self.triangles,
             query_min.contiguous().float(),
             query_max.contiguous().float(),
-            float(eps)
+            float(eps),
+            not pairs
         )
         return hit_mask, aabb_ids, face_ids
+
+
+def _msb(x):
+    """floor(log2(x)) for int64 x >= 1, exact.
+
+    Doubles hold every integer below 2**53 exactly, but log2 of (2**b - 1) can
+    round UP to b at the precision edge, so the float answer is clamp-corrected
+    with two integer comparisons instead of being trusted."""
+    m = torch.floor(torch.log2(x.double())).long()
+    m = torch.where((1 << m) > x, m - 1, m)
+    m = torch.where((1 << (m + 1)) <= x, m + 1, m)
+    return m
+
+
+def _build_lbvh_torch(vertices: torch.Tensor, faces: torch.Tensor,
+                      n_per_leaf: int = 4):
+    """
+    GPU LBVH build (Karras 2012), vectorized torch, no custom kernels.
+
+    Exists because build_bvh_cuda is CUDA in name only: it copies the mesh to
+    the host and builds the tree in single-threaded recursive C++ - 42 s for an
+    8.15M-triangle mesh whose every other pipeline stage runs in milliseconds.
+    This produces the same byte layout the traversal kernels reinterpret_cast
+    (BVHNode = bb_min[3], bb_max[3], left, right, pad; Triangle = a, b, c,
+    original_id; leaf ranges encoded as left = -start-1, right = -end-1), so
+    traversal, SAT, UDF and ray kernels run on it unchanged. The tree SHAPE
+    differs from the C++ builder's median split - query RESULTS do not, which
+    the equivalence test asserts on masks, pair sets and closest points.
+
+    All primitive coordinates enter leaf boxes exactly; only the split ORDER
+    comes from the quantized morton codes, so quantization affects quality,
+    never correctness.
+    """
+    dev = vertices.device
+    tri = vertices[faces.long()].float()                        # [M, 3, 3]
+    M = tri.shape[0]
+    cen = tri.mean(1)
+    lo, hi = tri.amin((0, 1)), tri.amax((0, 1))
+    q = ((cen - lo) / (hi - lo).clamp_min(1e-30) * 1023.0).clamp(0, 1023).long()
+
+    def spread(x):
+        x = (x | (x << 16)) & 0x030000FF
+        x = (x | (x << 8)) & 0x0300F00F
+        x = (x | (x << 4)) & 0x030C30C3
+        x = (x | (x << 2)) & 0x09249249
+        return x
+
+    morton = (spread(q[:, 0]) << 2) | (spread(q[:, 1]) << 1) | spread(q[:, 2])
+    # stable: duplicate morton codes are common (co-located primitives) and
+    # an unstable sort would make the tree shape run-to-run nondeterministic
+    order = torch.argsort(morton, stable=True)
+    tri_s = tri[order].reshape(M, 9)
+    oid = order.to(torch.int32)
+
+    L = (M + n_per_leaf - 1) // n_per_leaf
+    starts = torch.arange(L, device=dev) * n_per_leaf
+    ends = torch.clamp(starts + n_per_leaf, max=M)
+    ibits = max(1, int(L - 1).bit_length())
+    if 30 + ibits > 52:
+        # the exact-log2 delta runs out of double-precision bits around 16M
+        # faces; the caller falls back to the host builder rather than failing
+        return None
+    # first primitive's code, index-augmented: strictly increasing, unique
+    key = (morton[order][starts] << ibits) | torch.arange(L, device=dev)
+
+    # leaf AABBs (exact, from the primitives themselves)
+    leaf_of = torch.arange(M, device=dev) // n_per_leaf
+    lbb_min = torch.full((L, 3), float("inf"), device=dev)
+    lbb_max = torch.full((L, 3), float("-inf"), device=dev)
+    prim = tri_s.reshape(M, 3, 3)
+    ix = leaf_of[:, None].expand(M, 3)
+    lbb_min.scatter_reduce_(0, ix, prim.amin(1), "amin")
+    lbb_max.scatter_reduce_(0, ix, prim.amax(1), "amax")
+
+    if L == 1:
+        nodes = torch.zeros(1, 9, dtype=torch.float32, device=dev)
+        nodes[0, 0:3], nodes[0, 3:6] = lbb_min[0], lbb_max[0]
+        iview = nodes.view(torch.int32)
+        iview[0, 6], iview[0, 7] = -1, -int(M) - 1
+        tris = torch.empty(M, 10, dtype=torch.float32, device=dev)
+        tris[:, :9] = tri_s
+        tris[:, 9] = oid.view(torch.float32)
+        return nodes, tris
+
+    def delta(i, j):
+        ok = (j >= 0) & (j < L)
+        x = key[i] ^ key[j.clamp(0, L - 1)]
+        d = 63 - _msb(x.clamp_min(1))
+        return torch.where(ok, d, torch.full_like(d, -1))
+
+    i = torch.arange(L - 1, device=dev)
+    d = torch.sign(delta(i, i + 1) - delta(i, i - 1)).long()
+    d[d == 0] = 1
+    dmin = delta(i, i - d)
+    # upper bound for the range length, then binary-search it down
+    lmax = torch.full_like(i, 2)
+    for _ in range(int(L).bit_length() + 1):
+        grow = delta(i, i + lmax * d) > dmin
+        if not bool(grow.any()):
+            break
+        lmax = torch.where(grow, lmax * 2, lmax)
+    ln = torch.zeros_like(i)
+    t = lmax // 2
+    while bool((t > 0).any()):
+        better = (t > 0) & (delta(i, i + (ln + t) * d) > dmin)
+        ln = torch.where(better, ln + t, ln)
+        t = t // 2
+    j = i + ln * d
+    dnode = delta(i, j)
+    # split position: largest s with delta(i, i + s*d) > dnode
+    s = torch.zeros_like(i)
+    t = (ln + 1) // 2
+    while True:
+        better = delta(i, i + (s + t) * d) > dnode
+        s = torch.where(better, s + t, s)
+        if bool((t <= 1).all()):
+            break
+        t = (t + 1) // 2
+    gamma = i + s * d + torch.minimum(d, torch.zeros_like(d))
+    left_is_leaf = torch.minimum(i, j) == gamma
+    right_is_leaf = torch.maximum(i, j) == gamma + 1
+    left = torch.where(left_is_leaf, L - 1 + gamma, gamma)
+    right = torch.where(right_is_leaf, L + gamma, gamma + 1)
+
+    N = 2 * L - 1
+    nodes = torch.zeros(N, 9, dtype=torch.float32, device=dev)
+    iview = nodes.view(torch.int32)
+    iview[: L - 1, 6] = left.to(torch.int32)
+    iview[: L - 1, 7] = right.to(torch.int32)
+    iview[L - 1:, 6] = (-starts - 1).to(torch.int32)
+    iview[L - 1:, 7] = (-ends - 1).to(torch.int32)
+    nodes[L - 1:, 0:3] = lbb_min
+    nodes[L - 1:, 3:6] = lbb_max
+
+    # internal boxes bottom-up: a fixed-point sweep; each pass finalizes every
+    # node whose children are done, so the pass count is the tree depth
+    done = torch.zeros(N, dtype=torch.bool, device=dev)
+    done[L - 1:] = True
+    for _ in range(64):
+        ready = ~done[: L - 1] & done[left] & done[right]
+        if not bool(ready.any()):
+            break
+        r = torch.nonzero(ready).squeeze(-1)
+        nodes[r, 0:3] = torch.minimum(nodes[left[r], 0:3], nodes[right[r], 0:3])
+        nodes[r, 3:6] = torch.maximum(nodes[left[r], 3:6], nodes[right[r], 3:6])
+        done[r] = True
+    if not bool(done.all()):
+        raise RuntimeError("LBVH box sweep did not converge (malformed tree)")
+
+    tris = torch.empty(M, 10, dtype=torch.float32, device=dev)
+    tris[:, :9] = tri_s
+    tris[:, 9] = oid.view(torch.float32)
+    return nodes, tris
 
 
 # Check if BVH kernels are available
