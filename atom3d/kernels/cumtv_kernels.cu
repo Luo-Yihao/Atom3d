@@ -66,7 +66,8 @@ __device__ inline float length3(float3 v) {
  */
 __device__ bool triangle_aabb_sat(
     float3 v0, float3 v1, float3 v2,
-    float3 box_min, float3 box_max
+    float3 box_min, float3 box_max,
+    float sat_eps
 ) {
     // Compute box center and half-extents
     float3 box_center = make_float3(
@@ -85,8 +86,11 @@ __device__ bool triangle_aabb_sat(
     float3 tv1 = sub3(v1, box_center);
     float3 tv2 = sub3(v2, box_center);
     
-    // Small epsilon for edge-case detection (borderline intersections)
-    const float sat_eps = 1e-6f;
+    // sat_eps comes from the caller. The old hardcoded 1e-6f sits BELOW the
+    // fp32 noise floor at coordinate magnitude ~1 (one ulp is ~6e-8, and the
+    // test subtracts the box centre and takes cross products on top), so a
+    // surface grazing a cube edge tested as disjoint - in an octree broadphase
+    // that loses the subtree permanently. Callers doing broadphase pass ~1e-5.
     
     // Quick AABB rejection test with epsilon
     float min_v, max_v;
@@ -118,7 +122,8 @@ __device__ bool triangle_aabb_sat(
         float p2 = dot3(tv2, a); \
         float min_p = fminf(fminf(p0, p1), p2); \
         float max_p = fmaxf(fmaxf(p0, p1), p2); \
-        float rad = box_half.x * fabsf(a.x) + box_half.y * fabsf(a.y) + box_half.z * fabsf(a.z) + sat_eps; \
+        float rad = box_half.x * fabsf(a.x) + box_half.y * fabsf(a.y) + box_half.z * fabsf(a.z) \
+                    + sat_eps * sqrtf(dot3(a, a)); \
         if (min_p > rad || max_p < -rad) return false; \
     } while(0)
     
@@ -131,7 +136,8 @@ __device__ bool triangle_aabb_sat(
     // Test triangle plane with epsilon
     float3 normal = cross3(e0, e1);
     float d = -dot3(normal, tv0);
-    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z) + sat_eps;
+    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z)
+              + sat_eps * sqrtf(dot3(normal, normal));
     if (fabsf(d) > r) return false;
     
     return true;
@@ -151,6 +157,7 @@ __global__ void triangle_aabb_intersect_kernel(
     int num_faces,
     int num_aabbs,
     int max_hits,                           // P0-3 FIX: max output capacity
+    float sat_eps,
     bool* __restrict__ hit_mask,            // [K]
     int* __restrict__ aabb_ids,             // [max_hits] output pairs
     int* __restrict__ face_ids,             // [max_hits]
@@ -175,7 +182,7 @@ __global__ void triangle_aabb_intersect_kernel(
     float3 v2 = make_float3_from_ptr(vertices + idx2 * 3);
     
     // SAT test
-    if (triangle_aabb_sat(v0, v1, v2, box_min, box_max)) {
+    if (triangle_aabb_sat(v0, v1, v2, box_min, box_max, sat_eps)) {
         hit_mask[aabb_idx] = true;
         
         // P0-3 FIX: Bounds check before write to prevent memory overwrite
@@ -823,7 +830,8 @@ std::vector<at::Tensor> triangle_aabb_intersect_cuda(
     at::Tensor vertices,
     at::Tensor faces,
     at::Tensor aabb_min,
-    at::Tensor aabb_max
+    at::Tensor aabb_max,
+    double sat_eps
 ) {
     CHECK_INPUT(vertices);
     CHECK_INPUT(faces);
@@ -868,6 +876,7 @@ std::vector<at::Tensor> triangle_aabb_intersect_cuda(
             num_faces,
             num_aabbs,
             (int)max_hits,  // P0-3 FIX: Pass max_hits for bounds check
+            (float)sat_eps,
             hit_mask.data_ptr<bool>(),
             aabb_ids.data_ptr<int>(),
             face_ids.data_ptr<int>(),

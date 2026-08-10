@@ -91,7 +91,7 @@ def get_cuda_kernels():
 
 # Convenience functions
 
-def triangle_aabb_intersect(vertices, faces, aabb_min, aabb_max):
+def triangle_aabb_intersect(vertices, faces, aabb_min, aabb_max, eps=1e-6):
     """
     CUDA Triangle-AABB intersection using SAT
     
@@ -111,7 +111,8 @@ def triangle_aabb_intersect(vertices, faces, aabb_min, aabb_max):
         vertices.contiguous().float(),
         faces.contiguous().int(),
         aabb_min.contiguous().float(),
-        aabb_max.contiguous().float()
+        aabb_max.contiguous().float(),
+        float(eps)
     )
 
 

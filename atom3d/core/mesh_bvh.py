@@ -298,7 +298,8 @@ class MeshBVH:
         self,
         aabb_min: torch.Tensor,
         aabb_max: torch.Tensor,
-        mode: int = 1
+        mode: int = 1,
+        eps: float = 1e-6
     ) -> AABBIntersectResult:
         """
         Triangle-AABB batch intersection using exact clipping.
@@ -331,16 +332,24 @@ class MeshBVH:
         # that would permanently lose surface during octree broadphase)
         # Mode 2/3: use clip-based test for centroid/area/polygon output
         if mode <= 1:
-            return self._intersect_aabb_sat(aabb_min, aabb_max, return_pairs=(mode >= 1))
+            return self._intersect_aabb_sat(aabb_min, aabb_max,
+                                            return_pairs=(mode >= 1), eps=eps)
         return self._intersect_aabb_clip(aabb_min, aabb_max, mode)
     
     def _intersect_aabb_sat(
         self,
         aabb_min: torch.Tensor,
         aabb_max: torch.Tensor,
-        return_pairs: bool
+        return_pairs: bool,
+        eps: float = 1e-6
     ) -> AABBIntersectResult:
         """Basic SAT intersection (mode 0/1).
+
+        eps dilates the SAT test (and the BVH traversal consistently with it).
+        The 1e-6 default preserves the historical behaviour, but it is BELOW the
+        fp32 noise floor at coordinate magnitude ~1: an octree broadphase over a
+        [-1, 1] scene needs ~1e-5 or surfaces grazing a cell edge test as
+        disjoint and the subtree is lost permanently.
         
         Uses BVH-accelerated exact SAT test when available (O(N log M)).
         Falls back to brute-force CUDA kernel (O(N × M)).
@@ -352,7 +361,7 @@ class MeshBVH:
         if self._bvh is not None:
             try:
                 hit_mask, aabb_ids, face_ids = self._bvh.aabb_intersect(
-                    aabb_min.contiguous(), aabb_max.contiguous()
+                    aabb_min.contiguous(), aabb_max.contiguous(), eps=eps
                 )
                 if return_pairs:
                     return AABBIntersectResult(hit=hit_mask, aabb_ids=aabb_ids, face_ids=face_ids)
@@ -366,7 +375,7 @@ class MeshBVH:
             try:
                 hit_mask, aabb_ids, face_ids = triangle_aabb_intersect(
                     self.vertices, self.faces,
-                    aabb_min.contiguous(), aabb_max.contiguous()
+                    aabb_min.contiguous(), aabb_max.contiguous(), eps=eps
                 )
                 if return_pairs:
                     return AABBIntersectResult(hit=hit_mask, aabb_ids=aabb_ids, face_ids=face_ids)

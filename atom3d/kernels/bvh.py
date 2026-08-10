@@ -199,7 +199,8 @@ class BVHAccelerator:
     def aabb_intersect(
         self,
         query_min: torch.Tensor,
-        query_max: torch.Tensor
+        query_max: torch.Tensor,
+        eps: float = 1e-6
     ):
         """
         AABB-mesh intersection with exact SAT test.
@@ -218,7 +219,8 @@ class BVHAccelerator:
             self.nodes,
             self.triangles,
             query_min.contiguous().float(),
-            query_max.contiguous().float()
+            query_max.contiguous().float(),
+            float(eps)
         )
         return hit_mask, aabb_ids, face_ids
 

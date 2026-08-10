@@ -282,9 +282,8 @@ __device__ float ray_aabb_intersect(float3 ro, float3 rd, const float* bb_min, c
 }
 
 // Triangle-AABB SAT with epsilon tolerance for edge cases
-__device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 box_max) {
-    // Small epsilon for edge-case detection (borderline intersections)
-    const float sat_eps = 1e-6f;
+__device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 box_max,
+                                  float sat_eps) {
     
     float3 box_center = make_float3(
         (box_min.x + box_max.x) * 0.5f,
@@ -333,7 +332,8 @@ __device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 bo
         float p2 = dot3(v2, axis); \
         float min_p = fminf(fminf(p0, p1), p2); \
         float max_p = fmaxf(fmaxf(p0, p1), p2); \
-        float rad = box_half.x * fabsf(axis.x) + box_half.y * fabsf(axis.y) + box_half.z * fabsf(axis.z) + sat_eps; \
+        float rad = box_half.x * fabsf(axis.x) + box_half.y * fabsf(axis.y) + box_half.z * fabsf(axis.z) \
+                    + sat_eps * sqrtf(dot3(axis, axis)); \
         if (min_p > rad || max_p < -rad) return false; \
     } while(0)
     
@@ -346,7 +346,8 @@ __device__ bool triangle_aabb_sat(const Triangle& tri, float3 box_min, float3 bo
     // Test triangle normal with epsilon
     float3 normal = cross3(e0, sub3(v2, v0));
     float d = -dot3(normal, v0);
-    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z) + sat_eps;
+    float r = box_half.x * fabsf(normal.x) + box_half.y * fabsf(normal.y) + box_half.z * fabsf(normal.z)
+              + sat_eps * sqrtf(dot3(normal, normal));
     if (fabsf(d) > r) return false;
     
     return true;
@@ -558,11 +559,13 @@ __global__ void bvh_aabb_intersect_kernel(
     const float* __restrict__ query_min,
     const float* __restrict__ query_max,
     int num_queries,
+    float sat_eps,
     bool* __restrict__ hit_mask,
     int* __restrict__ hit_aabb_ids,
     int* __restrict__ hit_face_ids,
     int* __restrict__ hit_counter,
-    int max_hits
+    int max_hits,
+    int* __restrict__ stack_overflow
 ) {
     int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (q_idx >= num_queries) return;
@@ -580,7 +583,12 @@ __global__ void bvh_aabb_intersect_kernel(
         int idx = stack[--stack_ptr];
         const BVHNode& node = nodes[idx];
         
-        if (!aabb_overlap(node.bb_min, node.bb_max, q_min, q_max)) continue;
+        // Traversal must be at least as inclusive as the eps-dilated leaf SAT,
+        // or a grazing triangle is pruned before the test that would accept it:
+        // dilate the query for the overlap check only.
+        float3 qd_min = make_float3(q_min.x - sat_eps, q_min.y - sat_eps, q_min.z - sat_eps);
+        float3 qd_max = make_float3(q_max.x + sat_eps, q_max.y + sat_eps, q_max.z + sat_eps);
+        if (!aabb_overlap(node.bb_min, node.bb_max, qd_min, qd_max)) continue;
         
         if (node.left_idx < 0) {
             // Leaf: exact SAT test
@@ -588,7 +596,7 @@ __global__ void bvh_aabb_intersect_kernel(
             int end = -node.right_idx - 1;
             
             for (int i = start; i < end; i++) {
-                if (triangle_aabb_sat(triangles[i], q_min, q_max)) {
+                if (triangle_aabb_sat(triangles[i], q_min, q_max, sat_eps)) {
                     any_hit = true;
                     
                     int write_idx = atomicAdd(hit_counter, 1);
@@ -602,6 +610,10 @@ __global__ void bvh_aabb_intersect_kernel(
             if (stack_ptr < 127) {
                 stack[stack_ptr++] = node.right_idx;
                 stack[stack_ptr++] = node.left_idx;
+            } else {
+                // Dropping children silently turns a full stack into missing
+                // intersections. Record it so the host can refuse the answer.
+                atomicAdd(stack_overflow, 1);
             }
         }
     }
@@ -1193,7 +1205,8 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     at::Tensor nodes,
     at::Tensor triangles,
     at::Tensor query_min,
-    at::Tensor query_max
+    at::Tensor query_max,
+    double sat_eps
 ) {
     CHECK_INPUT(nodes);
     CHECK_INPUT(triangles);
@@ -1215,6 +1228,7 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
     auto hit_aabb_ids = torch::empty({max_hits}, opts_int);
     auto hit_face_ids = torch::empty({max_hits}, opts_int);
     auto hit_counter = torch::zeros({1}, opts_int);
+    auto stack_overflow = torch::zeros({1}, opts_int);
 
     int block_size = 256;
     int grid_size = (num_queries + block_size - 1) / block_size;
@@ -1226,11 +1240,13 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
             query_min.data_ptr<float>(),
             query_max.data_ptr<float>(),
             num_queries,
+            (float)sat_eps,
             hit_mask.data_ptr<bool>(),
             hit_aabb_ids.data_ptr<int>(),
             hit_face_ids.data_ptr<int>(),
             hit_counter.data_ptr<int>(),
-            max_hits
+            max_hits,
+            stack_overflow.data_ptr<int>()
         );
     };
     launch();
@@ -1252,6 +1268,11 @@ std::vector<at::Tensor> bvh_aabb_intersect_cuda(
         launch();
         final_hits = hit_counter[0].item<int>();
     }
+
+    TORCH_CHECK(stack_overflow[0].item<int>() == 0,
+                "bvh_aabb_intersect: traversal stack overflowed ",
+                stack_overflow[0].item<int>(), " times; results would be "
+                "missing intersections (tree deeper than 128)");
 
     return {
         hit_mask,
